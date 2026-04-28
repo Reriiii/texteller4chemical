@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import torch
+from PIL import Image
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+import sys
+
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from chemtexteller.model_loader import load_pretrained_model_and_tokenizer
+from chemtexteller.transforms import build_transform
+from chemtexteller.utils import ensure_dir, load_yaml, setup_logging
+
+
+logger = setup_logging()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Predict one EDU-CHEMC image.")
+    parser.add_argument("--model_ckpt", type=Path, required=True)
+    parser.add_argument("--image_path", type=Path, required=True)
+    parser.add_argument("--tokenizer_path", type=str, default=None)
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--save_txt", type=Path, default=None)
+    return parser.parse_args()
+
+
+def load_config(args: argparse.Namespace) -> dict:
+    if args.config is not None:
+        return load_yaml(args.config)
+    candidate = args.model_ckpt / "train_config.yaml"
+    if candidate.exists():
+        return load_yaml(candidate)
+    return {
+        "max_target_length": args.max_new_tokens,
+        "image_size": {"height": 384, "width": 768, "channels": 3},
+        "augmentation": {"enabled": False},
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    config = load_config(args)
+    bundle = load_pretrained_model_and_tokenizer(
+        model_name_or_path=str(args.model_ckpt),
+        tokenizer_path=args.tokenizer_path,
+        device=device,
+        trust_remote_code=args.trust_remote_code,
+    )
+    bundle.model.eval()
+    transform = build_transform(config, train=False, processor=bundle.processor)
+    with Image.open(args.image_path) as image:
+        pixel_values = transform(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        try:
+            generated = bundle.model.generate(
+                pixel_values=pixel_values,
+                num_beams=args.num_beams,
+                max_new_tokens=args.max_new_tokens,
+            )
+        except TypeError:
+            generated = bundle.model.generate(
+                inputs=pixel_values,
+                num_beams=args.num_beams,
+                max_new_tokens=args.max_new_tokens,
+            )
+    prediction = bundle.tokenizer.decode(generated[0], skip_special_tokens=True)
+    print(prediction)
+
+    if args.save_txt is not None:
+        ensure_dir(args.save_txt.parent)
+        args.save_txt.write_text(prediction + "\n", encoding="utf-8")
+        logger.info("Saved prediction to %s", args.save_txt)
+
+
+if __name__ == "__main__":
+    main()
