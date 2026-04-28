@@ -174,6 +174,14 @@ Use Kaggle config:
 configs/train_edu_chemc_kaggle.yaml
 ```
 
+For the first run, prefer:
+
+```text
+configs/train_edu_chemc_kaggle_fast.yaml
+```
+
+The normal Kaggle config is intentionally longer; the fast config is the safer notebook-time baseline.
+
 Kaggle paths usually look like:
 
 ```text

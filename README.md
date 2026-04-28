@@ -220,6 +220,16 @@ Fine-tune:
 
 Trên Kaggle, nếu bị OOM thì giảm `per_device_train_batch_size` về `1`, tăng `gradient_accumulation_steps`, hoặc thêm `--freeze_encoder`.
 
+For a first Kaggle baseline, prefer the fast 1-epoch config:
+
+```bash
+!accelerate launch scripts/train.py \
+  --config configs/train_edu_chemc_kaggle_fast.yaml \
+  --dataset_dir /kaggle/working/data/processed/edu_chemc \
+  --pretrained_model_name_or_path OleehyO/TexTeller \
+  --output_dir /kaggle/working/outputs/runs/edu_chemc_texteller_fast
+```
+
 Với tokenizer đã extend:
 
 ```bash

@@ -22,6 +22,14 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    for noisy_logger in (
+        "httpx",
+        "httpcore",
+        "huggingface_hub",
+        "huggingface_hub.utils._http",
+        "urllib3",
+    ):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     return logging.getLogger(LOGGER_NAME)
 
 
