@@ -108,6 +108,15 @@ def maybe_apply_lora(model: torch.nn.Module, cfg: dict[str, Any], cli_enabled: b
     return model
 
 
+def trainer_kwargs_for_processing_class(tokenizer: Any) -> dict[str, Any]:
+    signature = inspect.signature(Seq2SeqTrainer.__init__)
+    if "processing_class" in signature.parameters:
+        return {"processing_class": tokenizer}
+    if "tokenizer" in signature.parameters:
+        return {"tokenizer": tokenizer}
+    return {}
+
+
 def main() -> None:
     args = parse_args()
     config = load_yaml(args.config)
@@ -172,7 +181,7 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=collator,
-        tokenizer=bundle.tokenizer,
+        **trainer_kwargs_for_processing_class(bundle.tokenizer),
     )
 
     logger.info(
