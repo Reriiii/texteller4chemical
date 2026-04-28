@@ -32,7 +32,10 @@ def load_split_samples(split_dir: Path, target_key: str = "target") -> list[EduC
             raise ValueError(f"Missing file_name in {metadata_path}, row {idx}")
         if not isinstance(target, str) or not target.strip():
             raise ValueError(f"Missing string target in {metadata_path}, row {idx}")
-        samples.append(EduChemcSample(image_path=split_dir / file_name, target=target))
+        image_path = Path(file_name)
+        if not image_path.is_absolute():
+            image_path = split_dir / image_path
+        samples.append(EduChemcSample(image_path=image_path, target=target))
     return samples
 
 

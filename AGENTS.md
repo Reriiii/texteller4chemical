@@ -181,6 +181,14 @@ Kaggle paths usually look like:
 /kaggle/working
 ```
 
+When preparing data on Kaggle, use:
+
+```bash
+--copy_mode reference
+```
+
+This avoids copying all images from `/kaggle/input` into `/kaggle/working`. The metadata will contain absolute image paths and the dataset loader supports those paths.
+
 ## Tokenizer And Target Guidance
 
 Default target:

@@ -26,6 +26,22 @@ from chemtexteller.utils import copy_or_symlink, ensure_dir, save_json, setup_lo
 logger = setup_logging()
 
 
+def preview_directory(path: Path, max_items: int = 20) -> list[str]:
+    if not path.exists():
+        return ["<path does not exist>"]
+    if not path.is_dir():
+        return [f"<not a directory: {path}>"]
+    items: list[str] = []
+    for child in sorted(path.iterdir(), key=lambda p: p.name.lower()):
+        suffix = "/" if child.is_dir() else ""
+        items.append(f"{child.name}{suffix}")
+        if len(items) >= max_items:
+            break
+    if not items:
+        return ["<empty directory>"]
+    return items
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare EDU-CHEMC imagefolder dataset.")
     parser.add_argument("--src_dir", type=Path, required=True)
@@ -34,7 +50,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--copy_mode", choices=["copy", "symlink"], default="copy")
+    parser.add_argument(
+        "--copy_mode",
+        choices=["copy", "symlink", "reference"],
+        default="copy",
+        help=(
+            "copy duplicates images, symlink creates lightweight links, reference writes "
+            "absolute source image paths into metadata without creating image files."
+        ),
+    )
     parser.add_argument("--max_target_units", type=int, default=None)
     parser.add_argument("--min_width", type=int, default=1)
     parser.add_argument("--min_height", type=int, default=1)
@@ -112,9 +136,23 @@ def main() -> None:
     if args.target_field == "ssml_rcgd":
         logger.warning("Using ssml_rcgd. This is not recommended for a standard sequence decoder.")
 
+    if not args.src_dir.exists():
+        raise SystemExit(f"Source directory does not exist: {args.src_dir}")
+    if not args.src_dir.is_dir():
+        raise SystemExit(f"Source path is not a directory: {args.src_dir}")
     image_paths = sorted(
         path for path in args.src_dir.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS
     )
+    if not image_paths:
+        preview = "\n  - ".join(preview_directory(args.src_dir))
+        supported = ", ".join(sorted(IMAGE_EXTENSIONS))
+        raise SystemExit(
+            f"No image files found under: {args.src_dir}\n"
+            f"Supported extensions: {supported}\n"
+            "This usually means the Kaggle input path is one level too high/low, "
+            "or the dataset is still compressed as .zip/.rar/.7z.\n"
+            f"Top-level entries in src_dir:\n  - {preview}"
+        )
     stats: dict[str, Any] = {
         "total_image_files": len(image_paths),
         "valid_samples": 0,
@@ -173,10 +211,13 @@ def main() -> None:
         metadata_rows: list[dict[str, str]] = []
         for sample in tqdm(split_samples_, desc=f"Writing {split}"):
             src_image = sample["src_image"]
-            dst_name = f"sample_{global_idx:06d}{src_image.suffix.lower()}"
-            dst_path = split_dir / dst_name
-            copy_or_symlink(src_image, dst_path, args.copy_mode)
-            metadata_rows.append({"file_name": dst_name, "target": sample["target"]})
+            if args.copy_mode == "reference":
+                file_name = str(src_image.resolve())
+            else:
+                file_name = f"sample_{global_idx:06d}{src_image.suffix.lower()}"
+                dst_path = split_dir / file_name
+                copy_or_symlink(src_image, dst_path, args.copy_mode)
+            metadata_rows.append({"file_name": file_name, "target": sample["target"]})
             global_idx += 1
         write_jsonl(metadata_rows, split_dir / "metadata.jsonl")
 

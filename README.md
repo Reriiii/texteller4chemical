@@ -202,8 +202,11 @@ Chuẩn bị dataset, thay `<YOUR_KAGGLE_DATASET_DIR>` bằng path trong `/kaggl
 !python scripts/prepare_edu_chemc.py \
   --src_dir /kaggle/input/<YOUR_KAGGLE_DATASET_DIR> \
   --out_dir /kaggle/working/data/processed/edu_chemc \
-  --target_field ssml_sd
+  --target_field ssml_sd \
+  --copy_mode reference
 ```
+
+`--copy_mode reference` is recommended on Kaggle because it keeps images in `/kaggle/input` and writes only metadata/splits to `/kaggle/working`. Avoid `copy` on Kaggle unless you intentionally want to duplicate the full image dataset into the notebook output.
 
 Fine-tune:
 
