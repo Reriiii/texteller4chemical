@@ -4,11 +4,14 @@ import argparse
 import inspect
 import json
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
 import torch
+from tqdm.auto import tqdm
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers.trainer_callback import PrinterCallback, ProgressCallback, TrainerCallback
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -32,6 +35,93 @@ from chemtexteller.utils import ensure_dir, load_yaml, save_json, save_yaml, set
 logger = setup_logging()
 
 
+class StableTqdmProgressCallback(TrainerCallback):
+    """Progress bars tuned for terminals/log viewers that duplicate fast tqdm redraws."""
+
+    def __init__(
+        self,
+        mininterval: float = 5.0,
+        miniters: int = 10,
+        ncols: int = 100,
+        ascii_bar: bool = False,
+        max_str_len: int = 100,
+    ) -> None:
+        self.mininterval = mininterval
+        self.miniters = miniters
+        self.ncols = ncols
+        self.ascii_bar = ascii_bar
+        self.max_str_len = max_str_len
+        self.training_bar = None
+        self.prediction_bar = None
+        self.current_step = 0
+
+    def _bar(self, total: int, leave: bool) -> tqdm:
+        return tqdm(
+            total=total,
+            leave=leave,
+            dynamic_ncols=False,
+            ncols=self.ncols,
+            mininterval=self.mininterval,
+            miniters=self.miniters,
+            ascii=self.ascii_bar,
+            file=sys.stdout,
+        )
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            self.training_bar = self._bar(total=state.max_steps, leave=True)
+        self.current_step = 0
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.is_world_process_zero and self.training_bar is not None:
+            self.training_bar.update(state.global_step - self.current_step)
+            self.current_step = state.global_step
+
+    def on_prediction_step(self, args, state, control, eval_dataloader=None, **kwargs):
+        if not state.is_world_process_zero or eval_dataloader is None:
+            return
+        try:
+            total = len(eval_dataloader)
+        except TypeError:
+            return
+        if self.prediction_bar is None:
+            self.prediction_bar = self._bar(total=total, leave=self.training_bar is None)
+        self.prediction_bar.update(1)
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        self._close_prediction_bar(state)
+
+    def on_predict(self, args, state, control, **kwargs):
+        self._close_prediction_bar(state)
+
+    def _close_prediction_bar(self, state) -> None:
+        if state.is_world_process_zero and self.prediction_bar is not None:
+            self.prediction_bar.close()
+            self.prediction_bar = None
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_world_process_zero or self.training_bar is None or logs is None:
+            return
+        shallow_logs = {}
+        for key, value in logs.items():
+            if key == "total_flos":
+                continue
+            if isinstance(value, str) and len(value) > self.max_str_len:
+                shallow_logs[key] = (
+                    f"[String too long to display, length: {len(value)} > {self.max_str_len}]"
+                )
+            elif isinstance(value, float):
+                shallow_logs[key] = f"{value:.4g}"
+            else:
+                shallow_logs[key] = value
+        self.training_bar.write(str(shallow_logs))
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if state.is_world_process_zero and self.training_bar is not None:
+            self.training_bar.close()
+            self.training_bar = None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune pretrained TexTeller on EDU-CHEMC.")
     parser.add_argument("--config", type=Path, default=Path("configs/train_edu_chemc.yaml"))
@@ -50,6 +140,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict[str, Any]:
+    stable_tqdm = bool(training_cfg.get("stable_tqdm", True))
     kwargs = {
         "output_dir": str(output_dir),
         "num_train_epochs": training_cfg.get("num_train_epochs", 20),
@@ -65,6 +156,10 @@ def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict
         "bf16": training_cfg.get("bf16", False),
         "dataloader_num_workers": training_cfg.get("dataloader_num_workers", 4),
         "logging_steps": training_cfg.get("logging_steps", 50),
+        "logging_strategy": training_cfg.get("logging_strategy", "steps"),
+        "logging_first_step": training_cfg.get("logging_first_step", True),
+        "log_level": training_cfg.get("log_level", "info"),
+        "disable_tqdm": training_cfg.get("disable_tqdm", stable_tqdm),
         "eval_steps": training_cfg.get("eval_steps", 500),
         "save_steps": training_cfg.get("save_steps", 500),
         "save_total_limit": training_cfg.get("save_total_limit", 5),
@@ -80,6 +175,23 @@ def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict
     strategy_key = "eval_strategy" if "eval_strategy" in signature.parameters else "evaluation_strategy"
     kwargs[strategy_key] = training_cfg.get("eval_strategy", training_cfg.get("evaluation_strategy", "steps"))
     return kwargs
+
+
+def configure_progress_callback(trainer: Seq2SeqTrainer, training_cfg: dict[str, Any]) -> None:
+    if not bool(training_cfg.get("stable_tqdm", True)):
+        return
+
+    trainer.remove_callback(ProgressCallback)
+    trainer.remove_callback(PrinterCallback)
+    trainer.add_callback(
+        StableTqdmProgressCallback(
+            mininterval=float(training_cfg.get("tqdm_mininterval", 5.0)),
+            miniters=int(training_cfg.get("tqdm_miniters", 10)),
+            ncols=int(training_cfg.get("tqdm_ncols", 100)),
+            ascii_bar=bool(training_cfg.get("tqdm_ascii", False)),
+            max_str_len=int(training_cfg.get("tqdm_max_str_len", 100)),
+        )
+    )
 
 
 def maybe_apply_lora(model: torch.nn.Module, cfg: dict[str, Any], cli_enabled: bool) -> torch.nn.Module:
@@ -183,6 +295,7 @@ def main() -> None:
         data_collator=collator,
         **trainer_kwargs_for_processing_class(bundle.tokenizer),
     )
+    configure_progress_callback(trainer, config.get("training", {}))
 
     logger.info(
         "Starting fine-tuning with %s train and %s validation samples.",

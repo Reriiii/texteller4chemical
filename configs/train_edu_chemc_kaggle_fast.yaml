@@ -19,7 +19,7 @@ augmentation:
   random_erasing_prob: 0.00
 
 training:
-  num_train_epochs: 1
+  num_train_epochs: 5
   learning_rate: 1.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.05
@@ -32,6 +32,14 @@ training:
   bf16: false
   dataloader_num_workers: 2
   logging_steps: 25
+  logging_strategy: steps
+  logging_first_step: true
+  log_level: info
+  stable_tqdm: true
+  tqdm_mininterval: 5.0
+  tqdm_miniters: 10
+  tqdm_ncols: 100
+  tqdm_ascii: false
   eval_steps: 1000
   save_steps: 1000
   save_total_limit: 2

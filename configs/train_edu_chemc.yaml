@@ -32,6 +32,14 @@ training:
   bf16: false
   dataloader_num_workers: 4
   logging_steps: 50
+  logging_strategy: steps
+  logging_first_step: true
+  log_level: info
+  stable_tqdm: true
+  tqdm_mininterval: 5.0
+  tqdm_miniters: 10
+  tqdm_ncols: 100
+  tqdm_ascii: false
   eval_steps: 500
   save_steps: 500
   save_total_limit: 5

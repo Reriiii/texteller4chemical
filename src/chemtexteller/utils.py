@@ -66,7 +66,7 @@ def save_yaml(data: dict[str, Any], path: Path) -> None:
 def save_json(data: Any, path: Path) -> None:
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
         f.write("\n")
 
 

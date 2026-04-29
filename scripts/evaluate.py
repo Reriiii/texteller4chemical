@@ -5,6 +5,7 @@ import csv
 from pathlib import Path
 
 import torch
+from torch.utils.data import Subset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -23,6 +24,43 @@ from chemtexteller.utils import ensure_dir, load_yaml, save_json, setup_logging
 
 
 logger = setup_logging()
+
+
+TEMP_FIELDNAMES = [
+    "sample_index",
+    "image_path",
+    "ground_truth",
+    "prediction",
+    "exact_match",
+    "normalized_exact_match",
+    "token_edit_distance",
+    "normalized_token_edit_distance",
+    "char_edit_distance",
+]
+
+OUTPUT_FIELDNAMES = [name for name in TEMP_FIELDNAMES if name != "sample_index"]
+
+
+class SingleProcessAccelerator:
+    def __init__(self) -> None:
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.process_index = 0
+        self.num_processes = 1
+        self.is_main_process = True
+
+    def wait_for_everyone(self) -> None:
+        return
+
+
+def build_accelerator():
+    try:
+        from accelerate import Accelerator
+    except ImportError:
+        logger.warning(
+            "accelerate is not installed; evaluation will run on a single process/GPU."
+        )
+        return SingleProcessAccelerator()
+    return Accelerator()
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,14 +91,40 @@ def load_config(args: argparse.Namespace) -> dict:
     }
 
 
+def rank_output_path(output_csv: Path, process_index: int) -> Path:
+    return output_csv.with_name(f"{output_csv.stem}.rank{process_index}{output_csv.suffix}")
+
+
+def write_rows(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def read_rank_rows(paths: list[Path]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Missing distributed evaluation shard: {path}")
+        with path.open("r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                row["sample_index"] = int(row["sample_index"])
+                rows.append(row)
+    rows.sort(key=lambda row: int(row["sample_index"]))
+    return rows
+
+
 def main() -> None:
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    accelerator = build_accelerator()
+    device = accelerator.device
     config = load_config(args)
     bundle = load_pretrained_model_and_tokenizer(
         model_name_or_path=str(args.model_ckpt),
         tokenizer_path=args.tokenizer_path,
-        device=device,
+        device=str(device),
         trust_remote_code=args.trust_remote_code,
     )
     bundle.model.eval()
@@ -72,18 +136,35 @@ def main() -> None:
         transform=transform,
         max_target_length=int(config.get("max_target_length", args.max_new_tokens)),
     )
+    process_indices = list(range(accelerator.process_index, len(dataset), accelerator.num_processes))
+    eval_dataset = Subset(dataset, process_indices)
     loader = DataLoader(
-        dataset,
+        eval_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=VisionSeq2SeqCollator(bundle.tokenizer, include_metadata=True),
     )
 
     rows: list[dict[str, object]] = []
-    predictions: list[str] = []
-    references: list[str] = []
+    if accelerator.is_main_process:
+        logger.info(
+            "Evaluating %s samples on %s process(es).",
+            len(dataset),
+            accelerator.num_processes,
+        )
+    logger.info(
+        "Process %s evaluating %s samples on %s.",
+        accelerator.process_index,
+        len(eval_dataset),
+        device,
+    )
     with torch.no_grad():
-        for batch in tqdm(loader, desc=f"Evaluating {args.split}"):
+        progress = tqdm(
+            loader,
+            desc=f"Evaluating {args.split}",
+            disable=not accelerator.is_main_process,
+        )
+        for batch_idx, batch in enumerate(progress):
             pixel_values = batch["pixel_values"].to(device)
             try:
                 generated = bundle.model.generate(
@@ -98,12 +179,18 @@ def main() -> None:
                     max_new_tokens=args.max_new_tokens,
                 )
             decoded = bundle.tokenizer.batch_decode(generated, skip_special_tokens=True)
-            predictions.extend(decoded)
-            references.extend(batch["targets"])
-            for image_path, ref, pred in zip(batch["image_paths"], batch["targets"], decoded):
+            start = batch_idx * args.batch_size
+            batch_sample_indices = process_indices[start : start + len(decoded)]
+            for sample_index, image_path, ref, pred in zip(
+                batch_sample_indices,
+                batch["image_paths"],
+                batch["targets"],
+                decoded,
+            ):
                 sample_metrics = per_sample_metrics(pred, ref)
                 rows.append(
                     {
+                        "sample_index": sample_index,
                         "image_path": image_path,
                         "ground_truth": ref,
                         "prediction": pred,
@@ -111,24 +198,26 @@ def main() -> None:
                     }
                 )
 
+    rank_path = rank_output_path(args.output_csv, accelerator.process_index)
+    write_rows(rank_path, rows, TEMP_FIELDNAMES)
+    accelerator.wait_for_everyone()
+
+    if not accelerator.is_main_process:
+        return
+
+    rank_paths = [
+        rank_output_path(args.output_csv, process_index)
+        for process_index in range(accelerator.num_processes)
+    ]
+    rows = read_rank_rows(rank_paths)
+    predictions = [str(row["prediction"]) for row in rows]
+    references = [str(row["ground_truth"]) for row in rows]
     metrics = sequence_metrics(predictions, references)
-    ensure_dir(args.output_csv.parent)
-    with args.output_csv.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "image_path",
-                "ground_truth",
-                "prediction",
-                "exact_match",
-                "normalized_exact_match",
-                "token_edit_distance",
-                "normalized_token_edit_distance",
-                "char_edit_distance",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(rows)
+    output_rows = [
+        {field: row[field] for field in OUTPUT_FIELDNAMES}
+        for row in rows
+    ]
+    write_rows(args.output_csv, output_rows, OUTPUT_FIELDNAMES)
     metrics_path = args.output_csv.with_suffix(".metrics.json")
     save_json(metrics, metrics_path)
     logger.info("Metrics: %s", metrics)
