@@ -3,14 +3,25 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
 import shutil
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Sequence
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+warnings.filterwarnings("ignore", message=r".*warmup_ratio is deprecated.*")
+warnings.filterwarnings("ignore", message=r".*find_unused_parameters=True.*")
 
 import torch
 from tqdm.auto import tqdm
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers.utils import logging as transformers_logging
 from transformers.trainer_callback import PrinterCallback, ProgressCallback, TrainerCallback
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +44,7 @@ from chemtexteller.utils import ensure_dir, load_yaml, save_json, save_yaml, set
 
 
 logger = setup_logging()
+transformers_logging.set_verbosity_error()
 
 
 DEFAULT_LORA_TARGET_LEAVES = (
@@ -167,7 +179,6 @@ def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict
         "num_train_epochs": training_cfg.get("num_train_epochs", 20),
         "learning_rate": training_cfg.get("learning_rate", 1.0e-5),
         "weight_decay": training_cfg.get("weight_decay", 0.01),
-        "warmup_ratio": training_cfg.get("warmup_ratio", 0.05),
         "lr_scheduler_type": training_cfg.get("lr_scheduler_type", "cosine"),
         "per_device_train_batch_size": training_cfg.get("per_device_train_batch_size", 1),
         "per_device_eval_batch_size": training_cfg.get("per_device_eval_batch_size", 2),
@@ -178,8 +189,10 @@ def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict
         "dataloader_num_workers": training_cfg.get("dataloader_num_workers", 4),
         "logging_steps": training_cfg.get("logging_steps", 50),
         "logging_strategy": training_cfg.get("logging_strategy", "steps"),
-        "logging_first_step": training_cfg.get("logging_first_step", True),
+        "logging_first_step": training_cfg.get("logging_first_step", False),
         "log_level": training_cfg.get("log_level", "info"),
+        "log_level_replica": training_cfg.get("log_level_replica", "error"),
+        "log_on_each_node": training_cfg.get("log_on_each_node", False),
         "disable_tqdm": training_cfg.get("disable_tqdm", stable_tqdm),
         "eval_steps": training_cfg.get("eval_steps", 500),
         "save_steps": training_cfg.get("save_steps", 500),
@@ -193,9 +206,18 @@ def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict
         "predict_with_generate": False,
     }
     signature = inspect.signature(Seq2SeqTrainingArguments)
+    if "warmup_steps" in training_cfg:
+        kwargs["warmup_steps"] = training_cfg["warmup_steps"]
+    else:
+        kwargs["warmup_ratio"] = training_cfg.get("warmup_ratio", 0.05)
+    if "ddp_find_unused_parameters" in signature.parameters:
+        kwargs["ddp_find_unused_parameters"] = training_cfg.get(
+            "ddp_find_unused_parameters",
+            False,
+        )
     strategy_key = "eval_strategy" if "eval_strategy" in signature.parameters else "evaluation_strategy"
     kwargs[strategy_key] = training_cfg.get("eval_strategy", training_cfg.get("evaluation_strategy", "steps"))
-    return kwargs
+    return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
 
 def configure_progress_callback(trainer: Seq2SeqTrainer, training_cfg: dict[str, Any]) -> None:

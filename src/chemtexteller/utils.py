@@ -16,11 +16,17 @@ import yaml
 LOGGER_NAME = "chemtexteller"
 
 
+def is_main_process() -> bool:
+    return os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) in {"", "-1", "0"}
+
+
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
+    effective_level = level if is_main_process() else logging.WARNING
     logging.basicConfig(
-        level=level,
+        level=effective_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
     )
     for noisy_logger in (
         "httpx",
@@ -28,8 +34,11 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         "huggingface_hub",
         "huggingface_hub.utils._http",
         "urllib3",
+        "absl",
+        "tensorflow",
+        "tensorboard",
     ):
-        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+        logging.getLogger(noisy_logger).setLevel(logging.ERROR)
     return logging.getLogger(LOGGER_NAME)
 
 

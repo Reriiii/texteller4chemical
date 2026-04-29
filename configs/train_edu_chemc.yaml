@@ -33,8 +33,11 @@ training:
   dataloader_num_workers: 4
   logging_steps: 50
   logging_strategy: steps
-  logging_first_step: true
-  log_level: info
+  logging_first_step: false
+  log_level: warning
+  log_level_replica: error
+  log_on_each_node: false
+  ddp_find_unused_parameters: false
   stable_tqdm: true
   tqdm_mininterval: 5.0
   tqdm_miniters: 10
