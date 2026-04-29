@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import contextlib
 from pathlib import Path
 
 import torch
@@ -17,6 +18,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from chemtexteller.data import EduChemcDataset, VisionSeq2SeqCollator
+from chemtexteller.graph_matching_eval import (
+    lookup_target,
+    run_graph_matching_tool,
+    validate_graph_matching_tool,
+    write_graph_matching_files,
+)
 from chemtexteller.metrics import per_sample_metrics, sequence_metrics
 from chemtexteller.model_loader import load_pretrained_model_and_tokenizer
 from chemtexteller.transforms import build_transform
@@ -28,8 +35,10 @@ logger = setup_logging()
 
 TEMP_FIELDNAMES = [
     "sample_index",
+    "image_name",
     "image_path",
     "ground_truth",
+    "graph_label",
     "prediction",
     "exact_match",
     "normalized_exact_match",
@@ -75,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--output_csv", type=Path, default=Path("outputs/eval_predictions.csv"))
+    parser.add_argument("--graph_eval", action="store_true")
+    parser.add_argument("--graph_matching_tool_dir", type=Path, default=None)
+    parser.add_argument("--graph_label_key", type=str, default="ssml_normed")
+    parser.add_argument("--graph_num_workers", type=int, default=8)
+    parser.add_argument("--graph_output_txt", type=Path, default=None)
+    parser.add_argument("--graph_keep_temp", action="store_true")
     return parser.parse_args()
 
 
@@ -93,6 +108,41 @@ def load_config(args: argparse.Namespace) -> dict:
 
 def rank_output_path(output_csv: Path, process_index: int) -> Path:
     return output_csv.with_name(f"{output_csv.stem}.rank{process_index}{output_csv.suffix}")
+
+
+def graph_output_paths(output_csv: Path, output_txt: Path | None) -> tuple[Path, Path, Path]:
+    rec_path = output_csv.with_name(f"{output_csv.stem}.graph_rec.txt")
+    lab_path = output_csv.with_name(f"{output_csv.stem}.graph_lab.txt")
+    result_path = (
+        output_txt
+        if output_txt is not None
+        else output_csv.with_name(f"{output_csv.stem}.graph_result.txt")
+    )
+    return rec_path, lab_path, result_path
+
+
+def validate_graph_args(args: argparse.Namespace) -> None:
+    if not args.graph_eval:
+        return
+    if args.graph_matching_tool_dir is None:
+        raise SystemExit(
+            "--graph_matching_tool_dir is required when --graph_eval is enabled."
+        )
+    validate_graph_matching_tool(args.graph_matching_tool_dir)
+
+
+def validate_dataset_graph_labels(dataset: EduChemcDataset, label_key: str) -> None:
+    for idx, sample in enumerate(dataset.samples):
+        try:
+            lookup_target(sample.targets, label_key)
+        except KeyError as exc:
+            raise ValueError(
+                "Graph evaluation requires metadata label "
+                f"{label_key!r}, but it is missing for sample {idx} "
+                f"({sample.image_name}). Re-run scripts/prepare_edu_chemc.py so "
+                "metadata.jsonl includes targets.ssml_normed, or pass a different "
+                "--graph_label_key."
+            ) from exc
 
 
 def write_rows(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
@@ -119,6 +169,7 @@ def read_rank_rows(paths: list[Path]) -> list[dict[str, object]]:
 def main() -> None:
     args = parse_args()
     accelerator = build_accelerator()
+    validate_graph_args(args)
     device = accelerator.device
     config = load_config(args)
     bundle = load_pretrained_model_and_tokenizer(
@@ -136,6 +187,8 @@ def main() -> None:
         transform=transform,
         max_target_length=int(config.get("max_target_length", args.max_new_tokens)),
     )
+    if args.graph_eval:
+        validate_dataset_graph_labels(dataset, args.graph_label_key)
     process_indices = list(range(accelerator.process_index, len(dataset), accelerator.num_processes))
     eval_dataset = Subset(dataset, process_indices)
     loader = DataLoader(
@@ -181,18 +234,25 @@ def main() -> None:
             decoded = bundle.tokenizer.batch_decode(generated, skip_special_tokens=True)
             start = batch_idx * args.batch_size
             batch_sample_indices = process_indices[start : start + len(decoded)]
-            for sample_index, image_path, ref, pred in zip(
+            for sample_index, image_name, image_path, metadata_targets, ref, pred in zip(
                 batch_sample_indices,
+                batch["image_names"],
                 batch["image_paths"],
+                batch["metadata_targets"],
                 batch["targets"],
                 decoded,
             ):
+                graph_label = ""
+                if args.graph_eval:
+                    graph_label = lookup_target(metadata_targets, args.graph_label_key)
                 sample_metrics = per_sample_metrics(pred, ref)
                 rows.append(
                     {
                         "sample_index": sample_index,
+                        "image_name": image_name,
                         "image_path": image_path,
                         "ground_truth": ref,
+                        "graph_label": graph_label,
                         "prediction": pred,
                         **sample_metrics,
                     }
@@ -213,6 +273,37 @@ def main() -> None:
     predictions = [str(row["prediction"]) for row in rows]
     references = [str(row["ground_truth"]) for row in rows]
     metrics = sequence_metrics(predictions, references)
+    if args.graph_eval:
+        rec_path, lab_path, result_path = graph_output_paths(
+            args.output_csv,
+            args.graph_output_txt,
+        )
+        write_graph_matching_files(rows, rec_path, lab_path)
+        graph_result = run_graph_matching_tool(
+            tool_dir=args.graph_matching_tool_dir,
+            rec_path=rec_path,
+            lab_path=lab_path,
+            output_path=result_path,
+            num_workers=args.graph_num_workers,
+        )
+        metrics.update(graph_result.metrics)
+        metrics.update(
+            {
+                "graph_matching_tool_dir": str(args.graph_matching_tool_dir),
+                "graph_label_key": args.graph_label_key,
+                "graph_output_txt": str(graph_result.output_path),
+            }
+        )
+        logger.info(
+            "Graph matching metrics: EM(struct.line)=%.6f, Structure EM(struct)=%.6f",
+            metrics["graph_em"],
+            metrics["graph_structure_em"],
+        )
+        if not args.graph_keep_temp:
+            with contextlib.suppress(FileNotFoundError):
+                rec_path.unlink()
+            with contextlib.suppress(FileNotFoundError):
+                lab_path.unlink()
     output_rows = [
         {field: row[field] for field in OUTPUT_FIELDNAMES}
         for row in rows

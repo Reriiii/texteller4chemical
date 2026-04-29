@@ -25,6 +25,8 @@ from chemtexteller.utils import copy_or_symlink, ensure_dir, save_json, setup_lo
 
 logger = setup_logging()
 
+DEFAULT_TARGET_FIELDS = ("ssml_sd", "ssml_normed", "chemfig", "chemfg", "ssml_rcgd")
+
 
 def preview_directory(path: Path, max_items: int = 20) -> list[str]:
     if not path.exists():
@@ -88,6 +90,25 @@ def resolve_target(annotation: dict[str, Any], target_field: str) -> Any | None:
     if target_field == "chemfg" and "chemfig" in annotation:
         return annotation["chemfig"]
     return None
+
+
+def collect_targets(annotation: dict[str, Any], target_field: str) -> dict[str, str]:
+    fields = set(DEFAULT_TARGET_FIELDS)
+    fields.add(target_field)
+    targets: dict[str, str] = {}
+    for field in sorted(fields):
+        raw_target = resolve_target(annotation, field)
+        if raw_target is None:
+            continue
+        target = normalize_target(raw_target, field)
+        if target:
+            targets[field] = target
+
+    if "chemfg" in targets and "chemfig" not in targets:
+        targets["chemfig"] = targets["chemfg"]
+    if "chemfig" in targets and "chemfg" not in targets:
+        targets["chemfg"] = targets["chemfig"]
+    return targets
 
 
 def validate_image(path: Path, min_width: int, min_height: int) -> tuple[int, int]:
@@ -196,7 +217,14 @@ def main() -> None:
             stats["skipped_bad_image"] += 1
             continue
 
-        sample = {"src_image": image_path, "target": target, "length": len(units)}
+        targets = collect_targets(annotation, args.target_field)
+        targets[args.target_field] = target
+        sample = {
+            "src_image": image_path,
+            "target": target,
+            "targets": targets,
+            "length": len(units),
+        }
         samples.append(sample)
         token_counts.update(units)
         target_lengths.append(len(units))
@@ -208,16 +236,25 @@ def main() -> None:
     global_idx = 1
     for split, split_samples_ in splits.items():
         split_dir = ensure_dir(args.out_dir / split)
-        metadata_rows: list[dict[str, str]] = []
+        metadata_rows: list[dict[str, Any]] = []
         for sample in tqdm(split_samples_, desc=f"Writing {split}"):
             src_image = sample["src_image"]
+            image_name = f"sample_{global_idx:06d}{src_image.suffix.lower()}"
             if args.copy_mode == "reference":
                 file_name = str(src_image.resolve())
             else:
-                file_name = f"sample_{global_idx:06d}{src_image.suffix.lower()}"
+                file_name = image_name
                 dst_path = split_dir / file_name
                 copy_or_symlink(src_image, dst_path, args.copy_mode)
-            metadata_rows.append({"file_name": file_name, "target": sample["target"]})
+            metadata_rows.append(
+                {
+                    "file_name": file_name,
+                    "image_name": image_name,
+                    "target": sample["target"],
+                    "target_field": args.target_field,
+                    "targets": sample["targets"],
+                }
+            )
             global_idx += 1
         write_jsonl(metadata_rows, split_dir / "metadata.jsonl")
 

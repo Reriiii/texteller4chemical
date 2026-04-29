@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,29 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 class EduChemcSample:
     image_path: Path
     target: str
+    image_name: str
+    targets: dict[str, str] = field(default_factory=dict)
+
+
+def _metadata_targets(row: dict[str, Any], target_key: str, target: str) -> dict[str, str]:
+    targets: dict[str, str] = {}
+    raw_targets = row.get("targets")
+    if isinstance(raw_targets, dict):
+        for key, value in raw_targets.items():
+            if isinstance(value, str) and value.strip():
+                targets[str(key)] = value.strip()
+
+    for key, value in row.items():
+        if key in {"file_name", "image_name", "target", "target_field", "targets"}:
+            continue
+        if isinstance(value, str) and value.strip():
+            targets.setdefault(str(key), value.strip())
+
+    target_field = row.get("target_field")
+    if isinstance(target_field, str) and target_field:
+        targets.setdefault(target_field, target)
+    targets.setdefault(target_key, target)
+    return targets
 
 
 def load_split_samples(split_dir: Path, target_key: str = "target") -> list[EduChemcSample]:
@@ -35,7 +58,17 @@ def load_split_samples(split_dir: Path, target_key: str = "target") -> list[EduC
         image_path = Path(file_name)
         if not image_path.is_absolute():
             image_path = split_dir / image_path
-        samples.append(EduChemcSample(image_path=image_path, target=target))
+        image_name = row.get("image_name")
+        if not isinstance(image_name, str) or not image_name.strip():
+            image_name = Path(file_name).name
+        samples.append(
+            EduChemcSample(
+                image_path=image_path,
+                target=target,
+                image_name=image_name,
+                targets=_metadata_targets(row, target_key, target),
+            )
+        )
     return samples
 
 
@@ -76,6 +109,8 @@ class EduChemcDataset(Dataset[dict[str, Any]]):
             "labels": tokenized["input_ids"],
             "target": sample.target,
             "image_path": str(sample.image_path),
+            "image_name": sample.image_name,
+            "metadata_targets": sample.targets,
         }
 
 
@@ -119,4 +154,6 @@ class VisionSeq2SeqCollator:
         if self.include_metadata:
             batch["targets"] = [f["target"] for f in features]
             batch["image_paths"] = [f["image_path"] for f in features]
+            batch["image_names"] = [f["image_name"] for f in features]
+            batch["metadata_targets"] = [f["metadata_targets"] for f in features]
         return batch
