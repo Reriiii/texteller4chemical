@@ -6,7 +6,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from tqdm.auto import tqdm
@@ -33,6 +33,27 @@ from chemtexteller.utils import ensure_dir, load_yaml, save_json, save_yaml, set
 
 
 logger = setup_logging()
+
+
+DEFAULT_LORA_TARGET_LEAVES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "out_proj",
+    "query",
+    "key",
+    "value",
+    "dense",
+    "fc1",
+    "fc2",
+)
+
+EXCLUDED_LORA_TARGET_LEAVES = (
+    "embed_tokens",
+    "lm_head",
+    "output_projection",
+    "classifier",
+)
 
 
 class StableTqdmProgressCallback(TrainerCallback):
@@ -194,6 +215,78 @@ def configure_progress_callback(trainer: Seq2SeqTrainer, training_cfg: dict[str,
     )
 
 
+def _as_list(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value in {"auto", "auto_decoder", "all-linear"}:
+            return [value]
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, Sequence):
+        return [str(item) for item in value]
+    raise TypeError(f"Expected target_modules to be null, string, or list; got {type(value).__name__}")
+
+
+def _in_lora_scope(module_name: str, scope: str) -> bool:
+    if scope in {"all", "all_linear"}:
+        return True
+    if scope in {"decoder", "decoder_only"}:
+        return module_name.startswith("decoder") or ".decoder" in module_name
+    if scope in {"encoder", "encoder_only"}:
+        return module_name.startswith("encoder") or ".encoder" in module_name
+    raise ValueError(f"Unsupported LoRA target_scope: {scope}")
+
+
+def infer_lora_target_modules(
+    model: torch.nn.Module,
+    target_modules: Any,
+    target_scope: str = "decoder",
+) -> str | list[str]:
+    requested = _as_list(target_modules)
+    if requested and requested != ["auto"] and requested != ["auto_decoder"]:
+        if requested == ["all-linear"]:
+            return "all-linear"
+        return requested
+
+    scope = "decoder" if requested == ["auto_decoder"] else target_scope
+    linear_modules = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+    ]
+    scoped_leaves = {
+        name.rsplit(".", 1)[-1]
+        for name in linear_modules
+        if _in_lora_scope(name, scope)
+    }
+    selected = [
+        leaf
+        for leaf in DEFAULT_LORA_TARGET_LEAVES
+        if leaf in scoped_leaves and leaf not in EXCLUDED_LORA_TARGET_LEAVES
+    ]
+    if not selected:
+        selected = sorted(
+            leaf
+            for leaf in scoped_leaves
+            if leaf not in EXCLUDED_LORA_TARGET_LEAVES
+        )
+    if not selected:
+        raise RuntimeError(
+            f"Could not infer LoRA target modules for scope '{scope}'. "
+            "Set lora.target_modules explicitly in the config."
+        )
+
+    selected_set = set(selected)
+    has_same_leaf_outside_scope = any(
+        name.rsplit(".", 1)[-1] in selected_set and not _in_lora_scope(name, scope)
+        for name in linear_modules
+    )
+    if scope not in {"all", "all_linear"} and has_same_leaf_outside_scope:
+        leaf_pattern = "|".join(selected)
+        return rf".*{scope}.*\.({leaf_pattern})$"
+    return selected
+
+
 def maybe_apply_lora(model: torch.nn.Module, cfg: dict[str, Any], cli_enabled: bool) -> torch.nn.Module:
     lora_cfg = cfg.get("lora", {})
     enabled = cli_enabled or bool(lora_cfg.get("enabled", False))
@@ -205,15 +298,23 @@ def maybe_apply_lora(model: torch.nn.Module, cfg: dict[str, Any], cli_enabled: b
     except ImportError as exc:
         raise RuntimeError("LoRA requested but peft is not installed.") from exc
 
-    target_modules = lora_cfg.get("target_modules")
+    target_modules = infer_lora_target_modules(
+        model,
+        lora_cfg.get("target_modules", "auto"),
+        target_scope=str(lora_cfg.get("target_scope", "decoder")),
+    )
+    logger.info("Using LoRA target modules: %s", target_modules)
     kwargs = {
         "task_type": TaskType.SEQ_2_SEQ_LM,
         "r": int(lora_cfg.get("r", 16)),
         "lora_alpha": int(lora_cfg.get("alpha", 32)),
         "lora_dropout": float(lora_cfg.get("dropout", 0.05)),
+        "bias": str(lora_cfg.get("bias", "none")),
+        "target_modules": target_modules,
     }
-    if target_modules:
-        kwargs["target_modules"] = target_modules
+    modules_to_save = _as_list(lora_cfg.get("modules_to_save"))
+    if modules_to_save:
+        kwargs["modules_to_save"] = modules_to_save
     peft_config = LoraConfig(**kwargs)
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()

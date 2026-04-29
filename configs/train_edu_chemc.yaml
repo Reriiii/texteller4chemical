@@ -20,7 +20,7 @@ augmentation:
 
 training:
   num_train_epochs: 20
-  learning_rate: 1.0e-5
+  learning_rate: 5.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.05
   lr_scheduler_type: cosine
@@ -52,11 +52,14 @@ training:
     - tensorboard
 
 lora:
-  enabled: false
+  enabled: true
   r: 16
   alpha: 32
   dropout: 0.05
-  target_modules: null
+  target_modules: auto
+  target_scope: decoder
+  bias: none
+  modules_to_save: null
 
 freeze:
-  encoder: false
+  encoder: true

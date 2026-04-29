@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--output_csv", type=Path, default=Path("outputs/eval_predictions.csv"))
     return parser.parse_args()

@@ -125,6 +125,95 @@ def _try_texteller_package(
     raise RuntimeError("\n".join(errors))
 
 
+def _is_peft_checkpoint(model_name_or_path: str) -> bool:
+    path = Path(model_name_or_path)
+    return path.is_dir() and (path / "adapter_config.json").exists()
+
+
+def _hf_model_classes() -> list[Any]:
+    return [cls for cls in (AutoModelForVision2Seq, VisionEncoderDecoderModel) if cls is not None]
+
+
+def _load_hf_model(
+    model_name_or_path: str,
+    tokenizer: PreTrainedTokenizerBase,
+    device: str | None,
+    trust_remote_code: bool,
+) -> tuple[torch.nn.Module, str]:
+    errors: list[str] = []
+    for cls in _hf_model_classes():
+        try:
+            logger.info("Trying to load model with %s from %s", cls.__name__, model_name_or_path)
+            model = cls.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=trust_remote_code,
+            )
+            _configure_special_token_ids(model, tokenizer)
+            if device:
+                model.to(device)
+            return model, cls.__name__
+        except Exception as exc:
+            errors.append(f"{cls.__name__}: {exc}")
+    raise RuntimeError("\n".join(errors))
+
+
+def _load_peft_checkpoint(
+    adapter_path: str,
+    tokenizer_path: str | None,
+    device: str | None,
+    trust_remote_code: bool,
+) -> LoadedModelBundle:
+    try:
+        from peft import PeftConfig, PeftModel
+    except ImportError as exc:
+        raise RuntimeError("LoRA/PEFT checkpoint requested but peft is not installed.") from exc
+
+    peft_config = PeftConfig.from_pretrained(adapter_path)
+    base_model_name_or_path = getattr(peft_config, "base_model_name_or_path", None)
+    if not base_model_name_or_path:
+        raise RuntimeError(
+            f"PEFT adapter at {adapter_path} does not record base_model_name_or_path."
+        )
+
+    tokenizer_errors: list[str] = []
+    tokenizer: PreTrainedTokenizerBase | None = None
+    for source in (tokenizer_path, adapter_path, base_model_name_or_path):
+        if source is None:
+            continue
+        try:
+            tokenizer = _load_tokenizer(str(source), None, trust_remote_code)
+            break
+        except Exception as exc:
+            tokenizer_errors.append(f"{source}: {exc}")
+    if tokenizer is None:
+        detail = "\n".join(f"- {err}" for err in tokenizer_errors)
+        raise RuntimeError(f"Could not load tokenizer for PEFT checkpoint:\n{detail}")
+
+    processor = _load_processor(adapter_path, trust_remote_code)
+    if processor is None:
+        processor = _load_processor(str(base_model_name_or_path), trust_remote_code)
+
+    base_model, base_model_type = _load_hf_model(
+        str(base_model_name_or_path),
+        tokenizer=tokenizer,
+        device=None,
+        trust_remote_code=trust_remote_code,
+    )
+    resize_token_embeddings_if_needed(base_model, tokenizer)
+    logger.info("Loading PEFT adapter from %s onto %s", adapter_path, base_model_name_or_path)
+    model = PeftModel.from_pretrained(base_model, adapter_path, is_trainable=False)
+    _configure_special_token_ids(model, tokenizer)
+    if device:
+        model.to(device)
+    return LoadedModelBundle(
+        model=model,
+        tokenizer=tokenizer,
+        processor=processor,
+        source=adapter_path,
+        model_type=f"{base_model_type}+peft",
+    )
+
+
 def load_pretrained_model_and_tokenizer(
     model_name_or_path: str,
     tokenizer_path: str | None = None,
@@ -137,6 +226,14 @@ def load_pretrained_model_and_tokenizer(
             "checkpoint directory, or a local TexTeller checkpoint path."
         )
 
+    if _is_peft_checkpoint(model_name_or_path):
+        return _load_peft_checkpoint(
+            adapter_path=model_name_or_path,
+            tokenizer_path=tokenizer_path,
+            device=device,
+            trust_remote_code=trust_remote_code,
+        )
+
     errors: list[str] = []
     tokenizer: PreTrainedTokenizerBase | None = None
     try:
@@ -145,28 +242,24 @@ def load_pretrained_model_and_tokenizer(
         errors.append(f"AutoTokenizer: {exc}")
     processor = _load_processor(model_name_or_path, trust_remote_code)
 
-    model_classes = [cls for cls in (AutoModelForVision2Seq, VisionEncoderDecoderModel) if cls is not None]
-    for cls in model_classes:
-        try:
-            if tokenizer is None:
-                raise RuntimeError("HF tokenizer could not be loaded for this checkpoint.")
-            logger.info("Trying to load model with %s from %s", cls.__name__, model_name_or_path)
-            model = cls.from_pretrained(
-                model_name_or_path,
-                trust_remote_code=trust_remote_code,
-            )
-            _configure_special_token_ids(model, tokenizer)
-            if device:
-                model.to(device)
-            return LoadedModelBundle(
-                model=model,
-                tokenizer=tokenizer,
-                processor=processor,
-                source=model_name_or_path,
-                model_type=cls.__name__,
-            )
-        except Exception as exc:
-            errors.append(f"{cls.__name__}: {exc}")
+    try:
+        if tokenizer is None:
+            raise RuntimeError("HF tokenizer could not be loaded for this checkpoint.")
+        model, model_type = _load_hf_model(
+            model_name_or_path,
+            tokenizer=tokenizer,
+            device=device,
+            trust_remote_code=trust_remote_code,
+        )
+        return LoadedModelBundle(
+            model=model,
+            tokenizer=tokenizer,
+            processor=processor,
+            source=model_name_or_path,
+            model_type=model_type,
+        )
+    except Exception as exc:
+        errors.append(str(exc))
 
     try:
         logger.info("Trying to load model through optional texteller package.")
