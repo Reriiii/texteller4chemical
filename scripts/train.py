@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -155,6 +156,86 @@ class StableTqdmProgressCallback(TrainerCallback):
             self.training_bar = None
 
 
+class TrainingFileLogCallback(TrainerCallback):
+    """Append train/eval events to a JSONL file as soon as Trainer emits them."""
+
+    def __init__(self, jsonl_path: Path) -> None:
+        self.jsonl_path = jsonl_path
+        ensure_dir(jsonl_path.parent)
+
+    def _append_event(self, event: str, state, payload: dict[str, Any] | None = None) -> None:
+        if not state.is_world_process_zero:
+            return
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+            "step": state.global_step,
+            "epoch": state.epoch,
+        }
+        if payload:
+            record.update(payload)
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, default=str)
+            f.write("\n")
+            f.flush()
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._append_event(
+            "train_begin",
+            state,
+            {
+                "max_steps": state.max_steps,
+                "num_train_epochs": args.num_train_epochs,
+                "output_dir": args.output_dir,
+            },
+        )
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        logger.info("Epoch %.3f ended at step %s.", state.epoch or 0.0, state.global_step)
+        self._append_event("epoch_end", state)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        clean_logs = {key: value for key, value in logs.items() if key != "total_flos"}
+        self._append_event("log", state, clean_logs)
+        if not state.is_world_process_zero:
+            return
+        if "eval_loss" in clean_logs:
+            logger.info(
+                "Eval log | epoch=%.3f step=%s eval_loss=%.6g",
+                state.epoch or 0.0,
+                state.global_step,
+                float(clean_logs["eval_loss"]),
+            )
+        elif "loss" in clean_logs:
+            logger.info(
+                "Train log | epoch=%.3f step=%s loss=%.6g grad_norm=%s lr=%s",
+                state.epoch or 0.0,
+                state.global_step,
+                float(clean_logs["loss"]),
+                clean_logs.get("grad_norm"),
+                clean_logs.get("learning_rate"),
+            )
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        self._append_event("evaluate", state, metrics or {})
+
+    def on_save(self, args, state, control, **kwargs):
+        self._append_event("save", state, {"output_dir": args.output_dir})
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self._append_event("train_end", state, {"best_metric": state.best_metric})
+
+
+def training_log_paths(output_dir: Path) -> tuple[Path, Path]:
+    log_dir = ensure_dir(PROJECT_ROOT / "logs")
+    run_name = output_dir.name or "train"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = f"{run_name}_{timestamp}"
+    return log_dir / f"{stem}.log", log_dir / f"{stem}.trainer_events.jsonl"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune pretrained TexTeller on EDU-CHEMC.")
     parser.add_argument("--config", type=Path, default=Path("configs/train_edu_chemc.yaml"))
@@ -203,6 +284,7 @@ def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict
         "greater_is_better": training_cfg.get("greater_is_better", False),
         "report_to": training_cfg.get("report_to", ["tensorboard"]),
         "remove_unused_columns": False,
+        "label_names": ["labels"],
         "predict_with_generate": False,
     }
     signature = inspect.signature(Seq2SeqTrainingArguments)
@@ -316,7 +398,7 @@ def maybe_apply_lora(model: torch.nn.Module, cfg: dict[str, Any], cli_enabled: b
         return model
 
     try:
-        from peft import LoraConfig, TaskType, get_peft_model
+        from peft import LoraConfig, get_peft_model
     except ImportError as exc:
         raise RuntimeError("LoRA requested but peft is not installed.") from exc
 
@@ -327,7 +409,6 @@ def maybe_apply_lora(model: torch.nn.Module, cfg: dict[str, Any], cli_enabled: b
     )
     logger.info("Using LoRA target modules: %s", target_modules)
     kwargs = {
-        "task_type": TaskType.SEQ_2_SEQ_LM,
         "r": int(lora_cfg.get("r", 16)),
         "lora_alpha": int(lora_cfg.get("alpha", 32)),
         "lora_dropout": float(lora_cfg.get("dropout", 0.05)),
@@ -353,10 +434,15 @@ def trainer_kwargs_for_processing_class(tokenizer: Any) -> dict[str, Any]:
 
 
 def main() -> None:
+    global logger
     args = parse_args()
+    log_file, event_log_file = training_log_paths(args.output_dir)
+    logger = setup_logging(log_file=log_file)
     config = load_yaml(args.config)
     set_seed(int(config.get("seed", 42)))
     ensure_dir(args.output_dir)
+    logger.info("Writing run log to %s", log_file)
+    logger.info("Writing trainer event log to %s", event_log_file)
 
     if args.from_scratch:
         raise SystemExit(
@@ -419,6 +505,7 @@ def main() -> None:
         **trainer_kwargs_for_processing_class(bundle.tokenizer),
     )
     configure_progress_callback(trainer, config.get("training", {}))
+    trainer.add_callback(TrainingFileLogCallback(event_log_file))
 
     logger.info(
         "Starting fine-tuning with %s train and %s validation samples.",

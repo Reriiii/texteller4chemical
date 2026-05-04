@@ -354,14 +354,21 @@ def resize_token_embeddings_if_needed(
 
 
 def _current_embedding_size(model: torch.nn.Module) -> int | None:
-    for obj in (
-        model,
-        getattr(model, "decoder", None),
-        _safe_get_decoder(model),
+    for obj_name, obj in (
+        ("model", model),
+        ("model.decoder", getattr(model, "decoder", None)),
+        ("model.get_decoder()", _safe_get_decoder(model)),
     ):
         if obj is None or not hasattr(obj, "get_input_embeddings"):
             continue
-        embedding = obj.get_input_embeddings()
+        try:
+            embedding = obj.get_input_embeddings()
+        except NotImplementedError:
+            logger.debug("%s does not implement get_input_embeddings().", obj_name)
+            continue
+        except Exception as exc:
+            logger.debug("Could not inspect input embeddings on %s: %s", obj_name, exc)
+            continue
         if embedding is not None and hasattr(embedding, "num_embeddings"):
             return int(embedding.num_embeddings)
     return None

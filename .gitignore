@@ -7,4 +7,28 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
+
+# uv local caches/runtimes
+.uv-cache/
+.uv-python/
+
+# Local datasets
+data/
+
+# Training/evaluation artifacts
+outputs/
+logs/
+
+# External tools cloned locally
+external/
+
+# Local environment files
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

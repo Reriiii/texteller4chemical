@@ -20,12 +20,17 @@ def is_main_process() -> bool:
     return os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) in {"", "-1", "0"}
 
 
-def setup_logging(level: int = logging.INFO) -> logging.Logger:
+def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> logging.Logger:
     effective_level = level if is_main_process() else logging.WARNING
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file is not None and is_main_process():
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, mode="a", encoding="utf-8"))
     logging.basicConfig(
         level=effective_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
         force=True,
     )
     for noisy_logger in (

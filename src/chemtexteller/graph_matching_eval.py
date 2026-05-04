@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -47,6 +48,7 @@ def lookup_target(targets: Mapping[str, Any], key: str) -> str:
 
 
 def validate_graph_matching_tool(tool_dir: Path) -> Path:
+    tool_dir = tool_dir.resolve()
     eval_script = tool_dir / "eval.py"
     if not tool_dir.exists():
         raise FileNotFoundError(f"GraphMatchingTool directory does not exist: {tool_dir}")
@@ -130,6 +132,10 @@ def run_graph_matching_tool(
     num_workers: int,
 ) -> GraphMatchingResult:
     eval_script = validate_graph_matching_tool(tool_dir)
+    tool_dir = eval_script.parent
+    rec_path = rec_path.resolve()
+    lab_path = lab_path.resolve()
+    output_path = output_path.resolve()
     ensure_dir(output_path.parent)
     cmd = [
         sys.executable,
@@ -143,9 +149,12 @@ def run_graph_matching_tool(
         "-num_workers",
         str(num_workers),
     ]
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     completed = subprocess.run(
         cmd,
         cwd=str(tool_dir),
+        env=env,
         text=True,
         encoding="utf-8",
         errors="replace",

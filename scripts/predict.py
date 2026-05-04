@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from pathlib import Path
 
 import torch
@@ -29,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "fp32", "fp16", "bf16"],
+        default="auto",
+        help="Inference dtype. auto uses bf16 on supported CUDA GPUs, otherwise fp16 on CUDA.",
+    )
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--save_txt", type=Path, default=None)
     return parser.parse_args()
@@ -47,6 +54,61 @@ def load_config(args: argparse.Namespace) -> dict:
     }
 
 
+def resolve_inference_dtype(dtype_name: str, device: torch.device) -> torch.dtype | None:
+    if device.type != "cuda" or dtype_name == "fp32":
+        return None
+    if dtype_name == "bf16":
+        return torch.bfloat16
+    if dtype_name == "fp16":
+        return torch.float16
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def enable_generation_cache(model: torch.nn.Module) -> None:
+    candidates = [model]
+    if hasattr(model, "get_base_model"):
+        with contextlib.suppress(Exception):
+            candidates.append(model.get_base_model())
+    for attr in ("base_model", "model"):
+        obj = getattr(model, attr, None)
+        if obj is not None:
+            candidates.append(obj)
+
+    for obj in candidates:
+        for config_attr in ("config", "generation_config"):
+            config_obj = getattr(obj, config_attr, None)
+            if config_obj is None:
+                continue
+            if hasattr(config_obj, "use_cache"):
+                config_obj.use_cache = True
+            decoder_cfg = getattr(config_obj, "decoder", None)
+            if decoder_cfg is not None and hasattr(decoder_cfg, "use_cache"):
+                decoder_cfg.use_cache = True
+
+
+def generation_kwargs(
+    tokenizer,
+    num_beams: int,
+    max_new_tokens: int,
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "num_beams": num_beams,
+        "max_new_tokens": max_new_tokens,
+        "use_cache": True,
+    }
+    if tokenizer.pad_token_id is not None:
+        kwargs["pad_token_id"] = tokenizer.pad_token_id
+    if tokenizer.eos_token_id is not None:
+        kwargs["eos_token_id"] = tokenizer.eos_token_id
+    if tokenizer.bos_token_id is not None:
+        kwargs["decoder_start_token_id"] = tokenizer.bos_token_id
+    elif tokenizer.cls_token_id is not None:
+        kwargs["decoder_start_token_id"] = tokenizer.cls_token_id
+    return kwargs
+
+
 def main() -> None:
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -58,22 +120,38 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
     )
     bundle.model.eval()
+    enable_generation_cache(bundle.model)
+    device_obj = torch.device(device)
+    inference_dtype = resolve_inference_dtype(args.dtype, device_obj)
+    if inference_dtype is not None:
+        bundle.model.to(dtype=inference_dtype)
+        logger.info("Using %s inference for generation.", inference_dtype)
     transform = build_transform(config, train=False, processor=bundle.processor)
     with Image.open(args.image_path) as image:
         pixel_values = transform(image).unsqueeze(0).to(device)
+    if inference_dtype is not None:
+        pixel_values = pixel_values.to(dtype=inference_dtype)
 
-    with torch.no_grad():
+    gen_kwargs = generation_kwargs(
+        bundle.tokenizer,
+        num_beams=args.num_beams,
+        max_new_tokens=args.max_new_tokens,
+    )
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=inference_dtype)
+        if inference_dtype is not None
+        else contextlib.nullcontext()
+    )
+    with torch.inference_mode(), autocast_ctx:
         try:
             generated = bundle.model.generate(
                 pixel_values=pixel_values,
-                num_beams=args.num_beams,
-                max_new_tokens=args.max_new_tokens,
+                **gen_kwargs,
             )
         except TypeError:
             generated = bundle.model.generate(
                 inputs=pixel_values,
-                num_beams=args.num_beams,
-                max_new_tokens=args.max_new_tokens,
+                **gen_kwargs,
             )
     prediction = bundle.tokenizer.decode(generated[0], skip_special_tokens=True)
     print(prediction)
