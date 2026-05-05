@@ -35,7 +35,7 @@ Observed default properties:
 - channels: 1
 - image size: `448x448`
 - default config: `configs/train_edu_chemc.yaml`
-- current strongest local config: `configs/train_edu_chemc_normed_20ep_local_16gb.yaml`
+- baseline/reference config: `configs/train_edu_chemc_baseline.yaml`
 
 Keep preprocessing aligned with:
 
@@ -50,7 +50,7 @@ image_size:
 
 ```text
 configs/train_edu_chemc.yaml
-configs/train_edu_chemc_normed_20ep_local_16gb.yaml
+configs/train_edu_chemc_baseline.yaml
 scripts/prepare_edu_chemc.py
 scripts/analyze_targets.py
 scripts/analyze_tokenizer_coverage.py
@@ -99,24 +99,24 @@ uv run accelerate launch \
   --mixed_precision bf16 \
   --dynamo_backend no \
   scripts/train.py \
-  --config configs/train_edu_chemc_normed_20ep_local_16gb.yaml \
+  --config configs/train_edu_chemc.yaml \
   --dataset_dir data/processed/edu_chemc_normed \
   --pretrained_model_name_or_path OleehyO/TexTeller \
-  --output_dir outputs/runs/edu_chemc_texteller_normed_lora16_bf16_20ep
+  --output_dir outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep
 ```
 
 Evaluate with paper-style graph matching:
 
 ```bash
 uv run python scripts/evaluate.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller_normed_lora16_bf16_20ep/best \
+  --model_ckpt outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep/best \
   --dataset_dir data/processed/edu_chemc_normed \
   --split test \
   --batch_size 8 \
   --num_beams 1 \
   --max_new_tokens 768 \
   --dtype bf16 \
-  --output_csv outputs/eval_normed_lora16_20ep_test_greedy.csv \
+  --output_csv outputs/eval_normed_len768_r32_all_lora_balanced_30ep_test_greedy.csv \
   --graph_eval \
   --graph_matching_tool_dir external/GraphMatchingTool \
   --graph_label_key ssml_normed \
@@ -128,7 +128,7 @@ Predict one image:
 
 ```bash
 uv run python scripts/predict.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller_normed_lora16_bf16_20ep/best \
+  --model_ckpt outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep/best \
   --image_path /path/to/image.png
 ```
 
@@ -152,31 +152,19 @@ When VRAM is limited, prefer:
 
 ## Managed GPU Environments
 
-Avoid reinstalling PyTorch accidentally in managed notebook environments.
-
-Use:
-
-```bash
-pip install -r requirements-kaggle.txt
-pip install -e . --no-deps
-```
+Avoid reinstalling PyTorch accidentally in managed notebook environments. Install dependencies through the environment's preferred workflow, then use `pip install -e . --no-deps` for this repo.
 
 For read-only dataset mounts:
 
 ```bash
 uv run python scripts/prepare_edu_chemc.py \
   --src_dir /path/to/EDU-CHMEC_MM23 \
-  --out_dir data/processed/edu_chemc \
-  --target_field ssml_sd \
+  --out_dir data/processed/edu_chemc_normed \
+  --target_field ssml_normed \
   --copy_mode reference
 ```
 
-Use:
-
-```text
-configs/train_edu_chemc_kaggle.yaml
-configs/train_edu_chemc_kaggle_fast.yaml
-```
+Use `configs/train_edu_chemc.yaml` unless the user explicitly asks for a smaller custom managed-GPU config.
 
 ## Tokenizer And Target Guidance
 
@@ -213,7 +201,8 @@ Tradeoffs:
 
 - `ssml_normed` sequences are longer than `ssml_sd`.
 - With TexTeller tokenizer, `ssml_normed` train targets averaged about 268 tokens vs about 182 for `ssml_sd`.
-- `max_target_length: 512` truncates more `ssml_normed` samples than `ssml_sd`; consider `768` for a future experiment if runtime/VRAM allow it.
+- `configs/train_edu_chemc.yaml` uses `max_target_length: 768`, LoRA r32 over encoder+decoder, and length-balanced sampling to focus more on long targets.
+- `configs/train_edu_chemc_baseline.yaml` preserves the older 20ep decoder-only LoRA r16 baseline for comparison.
 
 Tokenizer risks:
 
@@ -266,7 +255,7 @@ logs/<run_name>_<timestamp>.log
 logs/<run_name>_<timestamp>.trainer_events.jsonl
 ```
 
-The 20ep local config logs/evaluates/saves by epoch. Keep large generated artifacts out of git:
+The default config logs by epoch and evaluates/saves every five epochs. Keep large generated artifacts out of git:
 
 ```text
 data/

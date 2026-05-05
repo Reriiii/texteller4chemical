@@ -139,15 +139,16 @@ def _load_hf_model(
     tokenizer: PreTrainedTokenizerBase,
     device: str | None,
     trust_remote_code: bool,
+    torch_dtype: torch.dtype | None = None,
 ) -> tuple[torch.nn.Module, str]:
     errors: list[str] = []
+    model_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    if torch_dtype is not None:
+        model_kwargs["torch_dtype"] = torch_dtype
     for cls in _hf_model_classes():
         try:
             logger.info("Trying to load model with %s from %s", cls.__name__, model_name_or_path)
-            model = cls.from_pretrained(
-                model_name_or_path,
-                trust_remote_code=trust_remote_code,
-            )
+            model = cls.from_pretrained(model_name_or_path, **model_kwargs)
             _configure_special_token_ids(model, tokenizer)
             if device:
                 model.to(device)
@@ -162,6 +163,7 @@ def _load_peft_checkpoint(
     tokenizer_path: str | None,
     device: str | None,
     trust_remote_code: bool,
+    torch_dtype: torch.dtype | None = None,
 ) -> LoadedModelBundle:
     try:
         from peft import PeftConfig, PeftModel
@@ -198,6 +200,7 @@ def _load_peft_checkpoint(
         tokenizer=tokenizer,
         device=None,
         trust_remote_code=trust_remote_code,
+        torch_dtype=torch_dtype,
     )
     resize_token_embeddings_if_needed(base_model, tokenizer)
     logger.info("Loading PEFT adapter from %s onto %s", adapter_path, base_model_name_or_path)
@@ -219,6 +222,7 @@ def load_pretrained_model_and_tokenizer(
     tokenizer_path: str | None = None,
     device: str | None = None,
     trust_remote_code: bool = False,
+    torch_dtype: torch.dtype | None = None,
 ) -> LoadedModelBundle:
     if not model_name_or_path:
         raise ValueError(
@@ -232,6 +236,7 @@ def load_pretrained_model_and_tokenizer(
             tokenizer_path=tokenizer_path,
             device=device,
             trust_remote_code=trust_remote_code,
+            torch_dtype=torch_dtype,
         )
 
     errors: list[str] = []
@@ -250,6 +255,7 @@ def load_pretrained_model_and_tokenizer(
             tokenizer=tokenizer,
             device=device,
             trust_remote_code=trust_remote_code,
+            torch_dtype=torch_dtype,
         )
         return LoadedModelBundle(
             model=model,
@@ -266,6 +272,8 @@ def load_pretrained_model_and_tokenizer(
         if tokenizer is None:
             tokenizer = _try_texteller_tokenizer(model_name_or_path, tokenizer_path)
         model = _try_texteller_package(model_name_or_path, device)
+        if torch_dtype is not None:
+            model.to(dtype=torch_dtype)
         _configure_special_token_ids(model, tokenizer)
         return LoadedModelBundle(
             model=model,

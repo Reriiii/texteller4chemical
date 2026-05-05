@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 from pathlib import Path
 
 import torch
@@ -14,9 +13,19 @@ import sys
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from chemtexteller.inference import (
+    autocast_context,
+    generate_from_pixel_values,
+    generation_kwargs,
+    load_inference_config,
+    merge_lora_for_inference,
+    move_pixel_values,
+    resolve_inference_dtype,
+    set_generation_cache,
+)
 from chemtexteller.model_loader import load_pretrained_model_and_tokenizer
 from chemtexteller.transforms import build_transform
-from chemtexteller.utils import ensure_dir, load_yaml, setup_logging
+from chemtexteller.utils import ensure_dir, setup_logging
 
 
 logger = setup_logging()
@@ -37,122 +46,47 @@ def parse_args() -> argparse.Namespace:
         help="Inference dtype. auto uses bf16 on supported CUDA GPUs, otherwise fp16 on CUDA.",
     )
     parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--no_merge_lora", action="store_true")
     parser.add_argument("--save_txt", type=Path, default=None)
     return parser.parse_args()
 
 
-def load_config(args: argparse.Namespace) -> dict:
-    if args.config is not None:
-        return load_yaml(args.config)
-    candidate = args.model_ckpt / "train_config.yaml"
-    if candidate.exists():
-        return load_yaml(candidate)
-    return {
-        "max_target_length": args.max_new_tokens,
-        "image_size": {"height": 384, "width": 768, "channels": 3},
-        "augmentation": {"enabled": False},
-    }
-
-
-def resolve_inference_dtype(dtype_name: str, device: torch.device) -> torch.dtype | None:
-    if device.type != "cuda" or dtype_name == "fp32":
-        return None
-    if dtype_name == "bf16":
-        return torch.bfloat16
-    if dtype_name == "fp16":
-        return torch.float16
-    if torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
-
-
-def enable_generation_cache(model: torch.nn.Module) -> None:
-    candidates = [model]
-    if hasattr(model, "get_base_model"):
-        with contextlib.suppress(Exception):
-            candidates.append(model.get_base_model())
-    for attr in ("base_model", "model"):
-        obj = getattr(model, attr, None)
-        if obj is not None:
-            candidates.append(obj)
-
-    for obj in candidates:
-        for config_attr in ("config", "generation_config"):
-            config_obj = getattr(obj, config_attr, None)
-            if config_obj is None:
-                continue
-            if hasattr(config_obj, "use_cache"):
-                config_obj.use_cache = True
-            decoder_cfg = getattr(config_obj, "decoder", None)
-            if decoder_cfg is not None and hasattr(decoder_cfg, "use_cache"):
-                decoder_cfg.use_cache = True
-
-
-def generation_kwargs(
-    tokenizer,
-    num_beams: int,
-    max_new_tokens: int,
-) -> dict[str, object]:
-    kwargs: dict[str, object] = {
-        "num_beams": num_beams,
-        "max_new_tokens": max_new_tokens,
-        "use_cache": True,
-    }
-    if tokenizer.pad_token_id is not None:
-        kwargs["pad_token_id"] = tokenizer.pad_token_id
-    if tokenizer.eos_token_id is not None:
-        kwargs["eos_token_id"] = tokenizer.eos_token_id
-    if tokenizer.bos_token_id is not None:
-        kwargs["decoder_start_token_id"] = tokenizer.bos_token_id
-    elif tokenizer.cls_token_id is not None:
-        kwargs["decoder_start_token_id"] = tokenizer.cls_token_id
-    return kwargs
-
-
 def main() -> None:
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    config = load_config(args)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        inference_dtype = resolve_inference_dtype(args.dtype, device)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    config = load_inference_config(args.model_ckpt, args.config, args.max_new_tokens)
     bundle = load_pretrained_model_and_tokenizer(
         model_name_or_path=str(args.model_ckpt),
         tokenizer_path=args.tokenizer_path,
-        device=device,
+        device=str(device),
         trust_remote_code=args.trust_remote_code,
+        torch_dtype=inference_dtype,
     )
-    bundle.model.eval()
-    enable_generation_cache(bundle.model)
-    device_obj = torch.device(device)
-    inference_dtype = resolve_inference_dtype(args.dtype, device_obj)
+    bundle.model = merge_lora_for_inference(bundle.model, enabled=not args.no_merge_lora)
     if inference_dtype is not None:
-        bundle.model.to(dtype=inference_dtype)
+        bundle.model.to(device=device, dtype=inference_dtype)
         logger.info("Using %s inference for generation.", inference_dtype)
+    else:
+        bundle.model.to(device)
+    bundle.model.eval()
+    set_generation_cache(bundle.model, enabled=True)
     transform = build_transform(config, train=False, processor=bundle.processor)
     with Image.open(args.image_path) as image:
-        pixel_values = transform(image).unsqueeze(0).to(device)
-    if inference_dtype is not None:
-        pixel_values = pixel_values.to(dtype=inference_dtype)
+        pixel_values = move_pixel_values(transform(image).unsqueeze(0), device, inference_dtype)
 
     gen_kwargs = generation_kwargs(
+        bundle.model,
         bundle.tokenizer,
         num_beams=args.num_beams,
         max_new_tokens=args.max_new_tokens,
     )
-    autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=inference_dtype)
-        if inference_dtype is not None
-        else contextlib.nullcontext()
-    )
+    autocast_ctx = autocast_context(device, inference_dtype)
     with torch.inference_mode(), autocast_ctx:
-        try:
-            generated = bundle.model.generate(
-                pixel_values=pixel_values,
-                **gen_kwargs,
-            )
-        except TypeError:
-            generated = bundle.model.generate(
-                inputs=pixel_values,
-                **gen_kwargs,
-            )
+        generated = generate_from_pixel_values(bundle.model, pixel_values, gen_kwargs)
     prediction = bundle.tokenizer.decode(generated[0], skip_special_tokens=True)
     print(prediction)
 

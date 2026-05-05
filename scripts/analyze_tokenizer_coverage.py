@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained_model_name_or_path", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--target_key", type=str, default="target")
-    parser.add_argument("--max_decoder_length", type=int, default=512)
+    parser.add_argument("--max_decoder_length", type=int, default=768)
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--extend_tokenizer", action="store_true")
     parser.add_argument("--vocab_file", type=Path, default=None)

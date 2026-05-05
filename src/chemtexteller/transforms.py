@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,11 +11,14 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as F
 
 
+logger = logging.getLogger("chemtexteller.transforms")
+
+
 @dataclass
 class ImagePreprocessConfig:
-    height: int = 384
-    width: int = 768
-    channels: int = 3
+    height: int = 448
+    width: int = 448
+    channels: int = 1
     pad_value: int = 255
     normalize_mean: tuple[float, ...] | None = None
     normalize_std: tuple[float, ...] | None = None
@@ -43,10 +47,10 @@ def _as_tuple(value: Any, channels: int) -> tuple[float, ...] | None:
 def image_config_from_dict(config: dict[str, Any]) -> ImagePreprocessConfig:
     image = config.get("image_size", {})
     aug = config.get("augmentation", {})
-    channels = int(image.get("channels", 3))
+    channels = int(image.get("channels", 1))
     return ImagePreprocessConfig(
-        height=int(image.get("height", 384)),
-        width=int(image.get("width", 768)),
+        height=int(image.get("height", 448)),
+        width=int(image.get("width", 448)),
         channels=channels,
         pad_value=int(image.get("pad_value", 255)),
         normalize_mean=_as_tuple(image.get("normalize_mean"), channels),
@@ -69,9 +73,23 @@ def apply_processor_stats(
     mean = getattr(image_processor, "image_mean", None)
     std = getattr(image_processor, "image_std", None)
     if cfg.normalize_mean is None and mean is not None:
-        cfg.normalize_mean = _as_tuple(mean, cfg.channels)
+        try:
+            cfg.normalize_mean = _as_tuple(mean, cfg.channels)
+        except ValueError:
+            logger.warning(
+                "Ignoring processor image_mean=%s for %s-channel input.",
+                mean,
+                cfg.channels,
+            )
     if cfg.normalize_std is None and std is not None:
-        cfg.normalize_std = _as_tuple(std, cfg.channels)
+        try:
+            cfg.normalize_std = _as_tuple(std, cfg.channels)
+        except ValueError:
+            logger.warning(
+                "Ignoring processor image_std=%s for %s-channel input.",
+                std,
+                cfg.channels,
+            )
     return cfg
 
 
@@ -79,9 +97,29 @@ class ResizePadTransform:
     def __init__(self, cfg: ImagePreprocessConfig, train: bool = False) -> None:
         self.cfg = cfg
         self.train = train
-        self.color_jitter = transforms.ColorJitter(
-            brightness=cfg.brightness,
-            contrast=cfg.contrast,
+        use_augmentation = train and cfg.augmentation_enabled
+        self.color_jitter = (
+            transforms.ColorJitter(
+                brightness=cfg.brightness,
+                contrast=cfg.contrast,
+            )
+            if use_augmentation and (cfg.brightness > 0 or cfg.contrast > 0)
+            else None
+        )
+        self.random_affine = (
+            transforms.RandomAffine(
+                degrees=cfg.affine_degrees,
+                translate=(cfg.affine_translate, cfg.affine_translate),
+                interpolation=InterpolationMode.BILINEAR,
+                fill=cfg.pad_value,
+            )
+            if use_augmentation and (cfg.affine_degrees > 0 or cfg.affine_translate > 0)
+            else None
+        )
+        self.gaussian_blur = (
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.6))
+            if use_augmentation and cfg.gaussian_blur_prob > 0
+            else None
         )
         self.random_erasing = transforms.RandomErasing(
             p=cfg.random_erasing_prob,
@@ -108,18 +146,13 @@ class ResizePadTransform:
         return tensor
 
     def _augment_pil(self, image: Image.Image) -> Image.Image:
-        if self.cfg.channels == 3 and (self.cfg.brightness > 0 or self.cfg.contrast > 0):
+        if self.color_jitter is not None:
             image = self.color_jitter(image)
-        if self.cfg.affine_degrees > 0 or self.cfg.affine_translate > 0:
-            image = transforms.RandomAffine(
-                degrees=self.cfg.affine_degrees,
-                translate=(self.cfg.affine_translate, self.cfg.affine_translate),
-                interpolation=InterpolationMode.BILINEAR,
-                fill=self.cfg.pad_value,
-            )(image)
-        if self.cfg.gaussian_blur_prob > 0:
+        if self.random_affine is not None:
+            image = self.random_affine(image)
+        if self.gaussian_blur is not None:
             if torch.rand(1).item() < self.cfg.gaussian_blur_prob:
-                image = transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.6))(image)
+                image = self.gaussian_blur(image)
         return image
 
     def _resize_and_pad(self, image: Image.Image) -> Image.Image:

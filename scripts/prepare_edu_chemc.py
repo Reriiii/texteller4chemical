@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare EDU-CHEMC imagefolder dataset.")
     parser.add_argument("--src_dir", type=Path, required=True)
     parser.add_argument("--out_dir", type=Path, default=Path("data/processed/edu_chemc"))
-    parser.add_argument("--target_field", type=str, default="ssml_sd")
+    parser.add_argument("--target_field", type=str, default="ssml_normed")
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)

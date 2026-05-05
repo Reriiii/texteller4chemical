@@ -2,8 +2,6 @@
 
 Fine-tune and domain-adapt pretrained TexTeller for handwritten chemical formula and chemical structure recognition on EDU-CHEMC / EDU-CHMEC_MM23.
 
-The project baseline is:
-
 ```text
 handwritten chemical image -> pretrained TexTeller -> chemical markup sequence
 ```
@@ -11,11 +9,24 @@ handwritten chemical image -> pretrained TexTeller -> chemical markup sequence
 ## Scope
 
 - Default model: `OleehyO/TexTeller`.
-- Default target: `ssml_sd`.
-- Default image format: grayscale `448x448x1`.
-- The baseline does not require Tex80M.
-- The baseline does not train TexTeller from scratch.
-- `ssml_rcgd` is not used for the baseline sequence decoder.
+- Current graph-eval target: `ssml_normed`.
+- Legacy/simple sequence target: `ssml_sd`.
+- Image format: grayscale `448x448x1`.
+- The project does not require Tex80M and does not train TexTeller from scratch by default.
+- `ssml_rcgd` is not used for the normal sequence-decoder baseline.
+
+## Configs
+
+Only two configs are kept:
+
+```text
+configs/train_edu_chemc.yaml
+configs/train_edu_chemc_baseline.yaml
+```
+
+`configs/train_edu_chemc.yaml` is the active experiment: `max_target_length: 768`, LoRA r32 on encoder+decoder, and length-balanced sampling.
+
+`configs/train_edu_chemc_baseline.yaml` preserves the earlier 20-epoch decoder-only LoRA r16 baseline for comparison.
 
 ## Setup
 
@@ -23,153 +34,95 @@ handwritten chemical image -> pretrained TexTeller -> chemical markup sequence
 uv sync
 ```
 
-For Kaggle or other managed GPU environments, avoid reinstalling PyTorch unless necessary:
-
-```bash
-pip install -r requirements-kaggle.txt
-pip install -e . --no-deps
-```
+For managed GPU environments, avoid reinstalling PyTorch unless needed. Install project dependencies from the environment's preferred package workflow, then use `pip install -e . --no-deps` for this repo.
 
 ## Prepare Data
 
 ```bash
 uv run python scripts/prepare_edu_chemc.py \
   --src_dir /path/to/EDU-CHMEC_MM23 \
-  --out_dir data/processed/edu_chemc \
-  --target_field ssml_sd
+  --out_dir data/processed/edu_chemc_normed \
+  --target_field ssml_normed
 ```
 
-For read-only dataset mounts, use references instead of copying images:
+For read-only dataset mounts, add:
 
 ```bash
-uv run python scripts/prepare_edu_chemc.py \
-  --src_dir /path/to/EDU-CHMEC_MM23 \
-  --out_dir data/processed/edu_chemc \
-  --target_field ssml_sd \
-  --copy_mode reference
+--copy_mode reference
 ```
 
-## Analyze Targets
+## Analyze
 
 ```bash
 uv run python scripts/analyze_targets.py \
-  --metadata data/processed/edu_chemc/train/metadata.jsonl
-```
+  --metadata data/processed/edu_chemc_normed/train/metadata.jsonl
 
-## Check Tokenizer Coverage
-
-```bash
 uv run python scripts/analyze_tokenizer_coverage.py \
-  --metadata data/processed/edu_chemc/train/metadata.jsonl \
+  --metadata data/processed/edu_chemc_normed/train/metadata.jsonl \
   --pretrained_model_name_or_path OleehyO/TexTeller
-```
-
-To extend the tokenizer:
-
-```bash
-uv run python scripts/analyze_tokenizer_coverage.py \
-  --metadata data/processed/edu_chemc/train/metadata.jsonl \
-  --pretrained_model_name_or_path OleehyO/TexTeller \
-  --extend_tokenizer \
-  --vocab_file /path/to/EDU-CHEMC.vocab \
-  --output_tokenizer_dir outputs/tokenizer_edu_chemc
 ```
 
 ## Train
 
 ```bash
-uv run accelerate launch scripts/train.py \
+uv run accelerate launch \
+  --num_machines 1 \
+  --mixed_precision bf16 \
+  --dynamo_backend no \
+  scripts/train.py \
   --config configs/train_edu_chemc.yaml \
-  --dataset_dir data/processed/edu_chemc \
+  --dataset_dir data/processed/edu_chemc_normed \
   --pretrained_model_name_or_path OleehyO/TexTeller \
-  --output_dir outputs/runs/edu_chemc_texteller
+  --output_dir outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep
 ```
 
-Kaggle configs:
-
-```text
-configs/train_edu_chemc_kaggle.yaml
-configs/train_edu_chemc_kaggle_fast.yaml
-```
-
-To train with an extended tokenizer:
+To reproduce the previous baseline, swap the config and output directory:
 
 ```bash
-uv run accelerate launch scripts/train.py \
-  --config configs/train_edu_chemc.yaml \
-  --dataset_dir data/processed/edu_chemc \
-  --pretrained_model_name_or_path OleehyO/TexTeller \
-  --tokenizer_path outputs/tokenizer_edu_chemc \
-  --output_dir outputs/runs/edu_chemc_texteller
+--config configs/train_edu_chemc_baseline.yaml
+--output_dir outputs/runs/edu_chemc_texteller_normed_lora16_bf16_20ep
 ```
 
 ## Evaluate
 
 ```bash
 uv run python scripts/evaluate.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller/best \
-  --dataset_dir data/processed/edu_chemc \
+  --model_ckpt outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep/best \
+  --dataset_dir data/processed/edu_chemc_normed \
   --split test \
-  --output_csv outputs/eval_predictions.csv
-```
-
-Current built-in metrics:
-
-- exact match
-- whitespace-normalized exact match
-- token edit distance
-- normalized token edit distance
-- character edit distance
-- average target length
-- average prediction length
-
-For paper-style graph matching evaluation, see `GRAPH_MATCHING_EVALUATION_AGENT_GUIDE.md`.
-
-If GraphMatchingTool is available locally:
-
-```bash
-uv run python scripts/evaluate.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller/best \
-  --dataset_dir data/processed/edu_chemc \
-  --split test \
+  --batch_size 8 \
+  --num_beams 1 \
+  --max_new_tokens 768 \
+  --dtype bf16 \
+  --output_csv outputs/eval_normed_len768_r32_all_lora_balanced_30ep_test_greedy.csv \
   --graph_eval \
   --graph_matching_tool_dir external/GraphMatchingTool \
-  --graph_label_key ssml_normed
+  --graph_label_key ssml_normed \
+  --graph_num_workers 0 \
+  --graph_keep_temp
 ```
+
+Built-in metrics include exact match, normalized exact match, token edit distance, normalized token edit distance, character edit distance, and length stats. With `--graph_eval`, GraphMatchingTool also reports graph EM and structure EM.
 
 ## Predict
 
 ```bash
 uv run python scripts/predict.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller/best \
-  --image_path /path/to/image.png
-```
-
-With beam search:
-
-```bash
-uv run python scripts/predict.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller/best \
+  --model_ckpt outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep/best \
   --image_path /path/to/image.png \
-  --num_beams 4 \
-  --max_new_tokens 512
+  --max_new_tokens 768
 ```
 
 ## Outputs
 
-Common output locations:
+Generated artifacts stay out of git:
 
 ```text
-data/processed/edu_chemc/
-outputs/reports/
-outputs/runs/edu_chemc_texteller/
-outputs/eval_predictions.csv
+data/
+outputs/
+logs/
+external/
+.uv-cache/
+.uv-python/
+.venv/
 ```
-
-## Notes
-
-- Keep `ssml_sd` as the default training target.
-- Use `ssml_normed` only when required by graph matching evaluation.
-- Preserve grayscale `448x448x1` preprocessing unless the model checkpoint requires a different format.
-- If the tokenizer is extended, decoder embeddings and the output projection must be resized.
-- If GPU memory is limited, use a smaller per-device batch size, gradient accumulation, encoder freezing, and LoRA.

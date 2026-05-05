@@ -24,10 +24,20 @@ from chemtexteller.graph_matching_eval import (
     validate_graph_matching_tool,
     write_graph_matching_files,
 )
+from chemtexteller.inference import (
+    autocast_context,
+    generate_from_pixel_values,
+    generation_kwargs,
+    load_inference_config,
+    merge_lora_for_inference,
+    move_pixel_values,
+    resolve_inference_dtype,
+    set_generation_cache,
+)
 from chemtexteller.metrics import per_sample_metrics, sequence_metrics
 from chemtexteller.model_loader import load_pretrained_model_and_tokenizer
 from chemtexteller.transforms import build_transform
-from chemtexteller.utils import ensure_dir, load_yaml, save_json, setup_logging
+from chemtexteller.utils import ensure_dir, save_json, setup_logging
 
 
 logger = setup_logging()
@@ -79,9 +89,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--target_key", type=str, default="target")
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--dataloader_num_workers", type=int, default=0)
+    parser.add_argument(
+        "--pin_memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pin host memory for GPU transfer. Defaults to true on CUDA.",
+    )
     parser.add_argument(
         "--max_samples",
         type=int,
@@ -95,6 +113,7 @@ def parse_args() -> argparse.Namespace:
         help="Inference dtype. auto uses bf16 on supported CUDA GPUs, otherwise fp16 on CUDA.",
     )
     parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--no_merge_lora", action="store_true")
     parser.add_argument("--output_csv", type=Path, default=Path("outputs/eval_predictions.csv"))
     parser.add_argument("--graph_eval", action="store_true")
     parser.add_argument("--graph_matching_tool_dir", type=Path, default=None)
@@ -103,74 +122,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph_output_txt", type=Path, default=None)
     parser.add_argument("--graph_keep_temp", action="store_true")
     return parser.parse_args()
-
-
-def load_config(args: argparse.Namespace) -> dict:
-    if args.config is not None:
-        return load_yaml(args.config)
-    candidate = args.model_ckpt / "train_config.yaml"
-    if candidate.exists():
-        return load_yaml(candidate)
-    return {
-        "max_target_length": args.max_new_tokens,
-        "image_size": {"height": 384, "width": 768, "channels": 3},
-        "augmentation": {"enabled": False},
-    }
-
-
-def resolve_inference_dtype(dtype_name: str, device: torch.device) -> torch.dtype | None:
-    if device.type != "cuda" or dtype_name == "fp32":
-        return None
-    if dtype_name == "bf16":
-        return torch.bfloat16
-    if dtype_name == "fp16":
-        return torch.float16
-    if torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
-
-
-def enable_generation_cache(model: torch.nn.Module) -> None:
-    candidates = [model]
-    if hasattr(model, "get_base_model"):
-        with contextlib.suppress(Exception):
-            candidates.append(model.get_base_model())
-    for attr in ("base_model", "model"):
-        obj = getattr(model, attr, None)
-        if obj is not None:
-            candidates.append(obj)
-
-    for obj in candidates:
-        for config_attr in ("config", "generation_config"):
-            config_obj = getattr(obj, config_attr, None)
-            if config_obj is None:
-                continue
-            if hasattr(config_obj, "use_cache"):
-                config_obj.use_cache = True
-            decoder_cfg = getattr(config_obj, "decoder", None)
-            if decoder_cfg is not None and hasattr(decoder_cfg, "use_cache"):
-                decoder_cfg.use_cache = True
-
-
-def generation_kwargs(
-    tokenizer,
-    num_beams: int,
-    max_new_tokens: int,
-) -> dict[str, object]:
-    kwargs: dict[str, object] = {
-        "num_beams": num_beams,
-        "max_new_tokens": max_new_tokens,
-        "use_cache": True,
-    }
-    if tokenizer.pad_token_id is not None:
-        kwargs["pad_token_id"] = tokenizer.pad_token_id
-    if tokenizer.eos_token_id is not None:
-        kwargs["eos_token_id"] = tokenizer.eos_token_id
-    if tokenizer.bos_token_id is not None:
-        kwargs["decoder_start_token_id"] = tokenizer.bos_token_id
-    elif tokenizer.cls_token_id is not None:
-        kwargs["decoder_start_token_id"] = tokenizer.cls_token_id
-    return kwargs
 
 
 def rank_output_path(output_csv: Path, process_index: int) -> Path:
@@ -238,19 +189,26 @@ def main() -> None:
     accelerator = build_accelerator()
     validate_graph_args(args)
     device = accelerator.device
-    config = load_config(args)
+    try:
+        inference_dtype = resolve_inference_dtype(args.dtype, device)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    config = load_inference_config(args.model_ckpt, args.config, args.max_new_tokens)
     bundle = load_pretrained_model_and_tokenizer(
         model_name_or_path=str(args.model_ckpt),
         tokenizer_path=args.tokenizer_path,
         device=str(device),
         trust_remote_code=args.trust_remote_code,
+        torch_dtype=inference_dtype,
     )
-    bundle.model.eval()
-    enable_generation_cache(bundle.model)
-    inference_dtype = resolve_inference_dtype(args.dtype, device)
+    bundle.model = merge_lora_for_inference(bundle.model, enabled=not args.no_merge_lora)
     if inference_dtype is not None:
-        bundle.model.to(dtype=inference_dtype)
+        bundle.model.to(device=device, dtype=inference_dtype)
         logger.info("Using %s inference for generation.", inference_dtype)
+    else:
+        bundle.model.to(device)
+    bundle.model.eval()
+    set_generation_cache(bundle.model, enabled=True)
 
     transform = build_transform(config, train=False, processor=bundle.processor)
     dataset = EduChemcDataset(
@@ -258,6 +216,8 @@ def main() -> None:
         tokenizer=bundle.tokenizer,
         transform=transform,
         max_target_length=int(config.get("max_target_length", args.max_new_tokens)),
+        target_key=args.target_key,
+        tokenize_targets=False,
     )
     if args.graph_eval:
         validate_dataset_graph_labels(dataset, args.graph_label_key)
@@ -265,12 +225,20 @@ def main() -> None:
     if args.max_samples is not None:
         sample_indices = sample_indices[: args.max_samples]
     process_indices = sample_indices[accelerator.process_index :: accelerator.num_processes]
+    pin_memory = device.type == "cuda" if args.pin_memory is None else args.pin_memory
+    loader_kwargs: dict[str, object] = {
+        "num_workers": args.dataloader_num_workers,
+        "pin_memory": pin_memory,
+    }
+    if args.dataloader_num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
     eval_dataset = Subset(dataset, process_indices)
     loader = DataLoader(
         eval_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=VisionSeq2SeqCollator(bundle.tokenizer, include_metadata=True),
+        **loader_kwargs,
     )
 
     rows: list[dict[str, object]] = []
@@ -287,15 +255,12 @@ def main() -> None:
         device,
     )
     gen_kwargs = generation_kwargs(
+        bundle.model,
         bundle.tokenizer,
         num_beams=args.num_beams,
         max_new_tokens=args.max_new_tokens,
     )
-    autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=inference_dtype)
-        if inference_dtype is not None
-        else contextlib.nullcontext()
-    )
+    autocast_ctx = autocast_context(device, inference_dtype)
     with torch.inference_mode(), autocast_ctx:
         progress = tqdm(
             loader,
@@ -303,19 +268,8 @@ def main() -> None:
             disable=not accelerator.is_main_process,
         )
         for batch_idx, batch in enumerate(progress):
-            pixel_values = batch["pixel_values"].to(device)
-            if inference_dtype is not None:
-                pixel_values = pixel_values.to(dtype=inference_dtype)
-            try:
-                generated = bundle.model.generate(
-                    pixel_values=pixel_values,
-                    **gen_kwargs,
-                )
-            except TypeError:
-                generated = bundle.model.generate(
-                    inputs=pixel_values,
-                    **gen_kwargs,
-                )
+            pixel_values = move_pixel_values(batch["pixel_values"], device, inference_dtype)
+            generated = generate_from_pixel_values(bundle.model, pixel_values, gen_kwargs)
             decoded = bundle.tokenizer.batch_decode(generated, skip_special_tokens=True)
             start = batch_idx * args.batch_size
             batch_sample_indices = process_indices[start : start + len(decoded)]

@@ -19,35 +19,37 @@ augmentation:
   random_erasing_prob: 0.00
 
 training:
-  num_train_epochs: 5
+  num_train_epochs: 20
   learning_rate: 5.0e-5
   weight_decay: 0.01
-  warmup_steps: 331
+  warmup_steps: 1325
   lr_scheduler_type: cosine
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 8
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
-  fp16: true
-  bf16: false
+  fp16: false
+  bf16: true
+  gradient_checkpointing: false
   dataloader_num_workers: 2
   logging_steps: 100
-  logging_strategy: steps
+  logging_strategy: epoch
   logging_first_step: false
   log_level: warning
   log_level_replica: error
   log_on_each_node: false
   ddp_find_unused_parameters: false
   stable_tqdm: true
+  tqdm_by_epoch: true
   tqdm_mininterval: 5.0
   tqdm_miniters: 10
   tqdm_ncols: 100
   tqdm_ascii: false
-  eval_steps: 2500
-  save_steps: 2500
-  save_total_limit: 2
-  eval_strategy: steps
-  save_strategy: steps
+  eval_steps: 5000
+  save_steps: 5000
+  save_total_limit: 4
+  eval_strategy: epoch
+  save_strategy: epoch
   load_best_model_at_end: true
   metric_for_best_model: eval_loss
   greater_is_better: false
