@@ -547,6 +547,13 @@ def save_model_with_assets(
         bundle.processor.save_pretrained(output_dir)
 
 
+def target_length_policy(config: dict[str, Any]) -> str:
+    data_cfg = config.get("data", {})
+    if isinstance(data_cfg, dict) and "target_length_policy" in data_cfg:
+        return str(data_cfg["target_length_policy"])
+    return str(config.get("target_length_policy", "error"))
+
+
 def configure_progress_callback(trainer: Seq2SeqTrainer, training_cfg: dict[str, Any]) -> None:
     if not bool(training_cfg.get("stable_tqdm", True)):
         return
@@ -728,6 +735,7 @@ def main() -> None:
     log_trainable_parameter_summary(bundle.model)
 
     max_target_length = int(config.get("max_target_length", 512))
+    length_policy = target_length_policy(config)
     train_transform = build_transform(config, train=True, processor=bundle.processor)
     eval_transform = build_transform(config, train=False, processor=bundle.processor)
     train_dataset = EduChemcDataset(
@@ -735,12 +743,14 @@ def main() -> None:
         tokenizer=bundle.tokenizer,
         transform=train_transform,
         max_target_length=max_target_length,
+        target_length_policy=length_policy,
     )
     eval_dataset = EduChemcDataset(
         split_dir=args.dataset_dir / "validation",
         tokenizer=bundle.tokenizer,
         transform=eval_transform,
         max_target_length=max_target_length,
+        target_length_policy=length_policy,
     )
     collator = VisionSeq2SeqCollator(bundle.tokenizer)
 

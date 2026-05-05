@@ -1,6 +1,9 @@
 seed: 42
 max_target_length: 512
 
+data:
+  target_length_policy: filter
+
 image_size:
   height: 448
   width: 448

@@ -9,7 +9,10 @@ from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
-from .utils import read_jsonl
+from .utils import get_logger, read_jsonl
+
+
+logger = get_logger("data")
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
@@ -94,15 +97,17 @@ class EduChemcDataset(Dataset[dict[str, Any]]):
         tokenize_targets: bool = True,
         validate_target_lengths: bool = True,
         length_check_batch_size: int = 512,
+        target_length_policy: str = "error",
     ) -> None:
         self.samples = load_split_samples(split_dir, target_key=target_key)
         self.tokenizer = tokenizer
         self.transform = transform
         self.max_target_length = max_target_length
         self.tokenize_targets = tokenize_targets
+        self.target_length_policy = target_length_policy
         self._target_token_lengths: list[int] | None = None
         if tokenize_targets and validate_target_lengths:
-            self._validate_target_lengths(batch_size=length_check_batch_size)
+            self._handle_target_lengths(batch_size=length_check_batch_size)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -149,7 +154,7 @@ class EduChemcDataset(Dataset[dict[str, Any]]):
             self._target_token_lengths = lengths
         return self._target_token_lengths
 
-    def _validate_target_lengths(self, batch_size: int) -> None:
+    def _handle_target_lengths(self, batch_size: int) -> None:
         lengths = self.target_token_lengths(batch_size=batch_size)
         too_long = [
             (idx, length)
@@ -162,11 +167,39 @@ class EduChemcDataset(Dataset[dict[str, Any]]):
             f"{self.samples[idx].image_name}:{length}"
             for idx, length in too_long[:5]
         )
-        raise ValueError(
+        message = (
             f"{len(too_long)} targets exceed max_target_length={self.max_target_length}; "
-            f"max_len={max(lengths)}; examples={examples}. Increase max_target_length "
-            "or filter long targets instead of silently truncating labels."
+            f"max_len={max(lengths)}; examples={examples}."
         )
+        policy = self.target_length_policy.lower()
+        if policy in {"error", "raise"}:
+            raise ValueError(
+                f"{message} Increase max_target_length or set data.target_length_policy "
+                "to 'filter' or 'truncate'."
+            )
+        if policy == "truncate":
+            logger.warning("%s These labels will be truncated.", message)
+            return
+        if policy != "filter":
+            raise ValueError(
+                "Unsupported target_length_policy "
+                f"{self.target_length_policy!r}; expected 'error', 'filter', or 'truncate'."
+            )
+
+        drop_indices = {idx for idx, _ in too_long}
+        self.samples = [
+            sample
+            for idx, sample in enumerate(self.samples)
+            if idx not in drop_indices
+        ]
+        self._target_token_lengths = [
+            length
+            for idx, length in enumerate(lengths)
+            if idx not in drop_indices
+        ]
+        if not self.samples:
+            raise ValueError(f"All samples were filtered by max_target_length={self.max_target_length}.")
+        logger.warning("%s Filtered these samples from this split.", message)
 
 
 class VisionSeq2SeqCollator:
