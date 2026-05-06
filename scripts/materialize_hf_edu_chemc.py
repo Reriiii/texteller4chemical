@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
@@ -86,6 +87,31 @@ def load_dataset_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     if args.cache_dir:
         kwargs["cache_dir"] = str(args.cache_dir)
     return kwargs
+
+
+def ensure_hf_cache_dirs(args: argparse.Namespace) -> None:
+    if args.cache_dir:
+        args.cache_dir.mkdir(parents=True, exist_ok=True)
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    (hf_home / "hub").mkdir(parents=True, exist_ok=True)
+    (hf_home / "datasets").mkdir(parents=True, exist_ok=True)
+
+
+def hf_download_error_message(args: argparse.Namespace, exc: FileNotFoundError) -> str:
+    offline_vars = [
+        name
+        for name in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")
+        if os.environ.get(name)
+    ]
+    hint = ""
+    if offline_vars:
+        hint = f"\nOffline env vars are set: {', '.join(offline_vars)}. Unset them to download."
+    cache_hint = "\nIf this server uses a custom disk, pass: --cache_dir /path/to/hf_cache"
+    return (
+        f"Could not download Hugging Face dataset {args.dataset_id!r}.\n"
+        "Check internet/proxy access to https://huggingface.co and Hugging Face offline env vars."
+        f"{hint}{cache_hint}\nOriginal error: {exc}"
+    )
 
 
 def normalize_target(raw: Any) -> str:
@@ -300,7 +326,11 @@ def main() -> None:
         raise SystemExit("The 'datasets' package is required. Run `uv sync` or install repo deps.") from exc
 
     logger.info("Loading Hugging Face dataset %s", args.dataset_id)
-    dataset = load_dataset(args.dataset_id, **load_dataset_kwargs(args))
+    ensure_hf_cache_dirs(args)
+    try:
+        dataset = load_dataset(args.dataset_id, **load_dataset_kwargs(args))
+    except FileNotFoundError as exc:
+        raise SystemExit(hf_download_error_message(args, exc)) from exc
     if not hasattr(dataset, "keys"):
         raise SystemExit(f"Expected a DatasetDict with splits, got {type(dataset).__name__}.")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import shutil
 import subprocess
@@ -105,7 +106,36 @@ def download_dataset(args: argparse.Namespace) -> None:
         from datasets import load_dataset
     except ImportError as exc:
         raise SystemExit("The 'datasets' package is required. Run `uv sync` or install repo deps.") from exc
-    load_dataset(args.dataset_id, **load_dataset_kwargs(args))
+    ensure_hf_cache_dirs(args)
+    try:
+        load_dataset(args.dataset_id, **load_dataset_kwargs(args))
+    except FileNotFoundError as exc:
+        raise SystemExit(hf_download_error_message(args, exc)) from exc
+
+
+def ensure_hf_cache_dirs(args: argparse.Namespace) -> None:
+    if args.cache_dir:
+        args.cache_dir.mkdir(parents=True, exist_ok=True)
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    (hf_home / "hub").mkdir(parents=True, exist_ok=True)
+    (hf_home / "datasets").mkdir(parents=True, exist_ok=True)
+
+
+def hf_download_error_message(args: argparse.Namespace, exc: FileNotFoundError) -> str:
+    offline_vars = [
+        name
+        for name in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")
+        if os.environ.get(name)
+    ]
+    hint = ""
+    if offline_vars:
+        hint = f"\nOffline env vars are set: {', '.join(offline_vars)}. Unset them to download."
+    cache_hint = f"\nIf this server uses a custom disk, pass: --cache_dir /path/to/hf_cache"
+    return (
+        f"Could not download Hugging Face dataset {args.dataset_id!r}.\n"
+        "Check internet/proxy access to https://huggingface.co and Hugging Face offline env vars."
+        f"{hint}{cache_hint}\nOriginal error: {exc}"
+    )
 
 
 def append_optional_hf_args(cmd: list[str], args: argparse.Namespace) -> None:
