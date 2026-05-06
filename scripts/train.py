@@ -476,6 +476,11 @@ def parse_args() -> argparse.Namespace:
 
 def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict[str, Any]:
     stable_tqdm = bool(training_cfg.get("stable_tqdm", True))
+    eval_strategy = training_cfg.get(
+        "eval_strategy",
+        training_cfg.get("evaluation_strategy", "epoch"),
+    )
+    save_strategy = training_cfg.get("save_strategy", eval_strategy)
     kwargs = {
         "output_dir": str(output_dir),
         "num_train_epochs": training_cfg.get("num_train_epochs", 20),
@@ -496,10 +501,8 @@ def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict
         "log_level_replica": training_cfg.get("log_level_replica", "error"),
         "log_on_each_node": training_cfg.get("log_on_each_node", False),
         "disable_tqdm": training_cfg.get("disable_tqdm", stable_tqdm),
-        "eval_steps": training_cfg.get("eval_steps", 500),
-        "save_steps": training_cfg.get("save_steps", 500),
         "save_total_limit": training_cfg.get("save_total_limit", 5),
-        "save_strategy": training_cfg.get("save_strategy", "steps"),
+        "save_strategy": save_strategy,
         "load_best_model_at_end": training_cfg.get("load_best_model_at_end", True),
         "metric_for_best_model": training_cfg.get("metric_for_best_model", "eval_loss"),
         "greater_is_better": training_cfg.get("greater_is_better", False),
@@ -513,13 +516,17 @@ def training_args_kwargs(output_dir: Path, training_cfg: dict[str, Any]) -> dict
         kwargs["warmup_steps"] = training_cfg["warmup_steps"]
     else:
         kwargs["warmup_ratio"] = training_cfg.get("warmup_ratio", 0.05)
+    if str(eval_strategy).lower() == "steps":
+        kwargs["eval_steps"] = training_cfg.get("eval_steps", 500)
+    if str(save_strategy).lower() == "steps":
+        kwargs["save_steps"] = training_cfg.get("save_steps", 500)
     if "ddp_find_unused_parameters" in signature.parameters:
         kwargs["ddp_find_unused_parameters"] = training_cfg.get(
             "ddp_find_unused_parameters",
             False,
         )
     strategy_key = "eval_strategy" if "eval_strategy" in signature.parameters else "evaluation_strategy"
-    kwargs[strategy_key] = training_cfg.get("eval_strategy", training_cfg.get("evaluation_strategy", "steps"))
+    kwargs[strategy_key] = eval_strategy
     return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
 

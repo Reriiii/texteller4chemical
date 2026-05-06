@@ -61,11 +61,9 @@ training:
   tqdm_miniters: 10
   tqdm_ncols: 100
   tqdm_ascii: false
-  eval_steps: 13250
-  save_steps: 13250
   save_total_limit: 4
-  eval_strategy: steps
-  save_strategy: steps
+  eval_strategy: epoch
+  save_strategy: epoch
   load_best_model_at_end: true
   metric_for_best_model: eval_loss
   greater_is_better: false
