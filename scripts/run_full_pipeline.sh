@@ -4,9 +4,14 @@ set -euo pipefail
 # Linux GPU server wrapper for the full EDU-CHEMC pipeline.
 # Override defaults with env vars, and pass extra args through to the Python launcher.
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+cd "${PROJECT_ROOT}"
+
 STAGES=${STAGES:-all}
 DATASET_ID=${DATASET_ID:-ConstantHao/EDU-CHEMC_MM23}
 DATASET_DIR=${DATASET_DIR:-data/processed/edu_chemc_normed}
+CACHE_DIR=${CACHE_DIR:-${PROJECT_ROOT}/data/hf_cache/datasets}
 TARGET_FIELD=${TARGET_FIELD:-ssml_normed}
 CONFIG=${CONFIG:-configs/train_edu_chemc.yaml}
 PRETRAINED_MODEL=${PRETRAINED_MODEL:-OleehyO/TexTeller}
@@ -17,9 +22,14 @@ GRAPH_NUM_WORKERS=${GRAPH_NUM_WORKERS:-8}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 DTYPE=${DTYPE:-bf16}
 
+export HF_HOME=${HF_HOME:-${PROJECT_ROOT}/data/hf_cache}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${CACHE_DIR}}
+mkdir -p "${HF_HOME}/hub" "${HF_DATASETS_CACHE}"
+
 uv run python scripts/run_edu_chemc_pipeline.py \
   --stages ${STAGES} \
   --dataset_id "${DATASET_ID}" \
+  --cache_dir "${HF_DATASETS_CACHE}" \
   --dataset_dir "${DATASET_DIR}" \
   --target_field "${TARGET_FIELD}" \
   --config "${CONFIG}" \

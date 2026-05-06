@@ -91,10 +91,26 @@ def load_dataset_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 
 def ensure_hf_cache_dirs(args: argparse.Namespace) -> None:
     if args.cache_dir:
-        args.cache_dir.mkdir(parents=True, exist_ok=True)
+        ensure_directory(args.cache_dir, "HF datasets cache")
     hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    (hf_home / "hub").mkdir(parents=True, exist_ok=True)
-    (hf_home / "datasets").mkdir(parents=True, exist_ok=True)
+    ensure_directory(hf_home, "HF_HOME")
+    ensure_directory(hf_home / "hub", "HF hub cache")
+    ensure_directory(hf_home / "datasets", "HF datasets cache")
+
+
+def ensure_directory(path: Path, label: str) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as exc:
+        raise SystemExit(
+            f"{label} path exists but is not a directory: {path}. "
+            "Set HF_HOME and --cache_dir to a writable directory."
+        ) from exc
+    if not path.is_dir():
+        raise SystemExit(
+            f"{label} path exists but is not a directory: {path}. "
+            "Set HF_HOME and --cache_dir to a writable directory."
+        )
 
 
 def hf_download_error_message(args: argparse.Namespace, exc: FileNotFoundError) -> str:
