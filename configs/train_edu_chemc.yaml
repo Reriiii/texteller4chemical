@@ -1,8 +1,8 @@
 seed: 42
-max_target_length: 1536
+max_target_length: 1024
 
 data:
-  target_length_policy: error
+  target_length_policy: filter
 
 image_size:
   height: 448
@@ -31,7 +31,7 @@ sampling:
         weight: 1.5
       - max_length: 768
         weight: 3.0
-      - max_length: 1536
+      - max_length: 1024
         weight: 4.0
       - max_length: null
         weight: 4.0
