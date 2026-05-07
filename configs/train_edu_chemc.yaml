@@ -37,10 +37,10 @@ sampling:
         weight: 4.0
 
 training:
-  num_train_epochs: 150
+  num_train_epochs: 50
   learning_rate: 3.0e-5
   weight_decay: 0.01
-  warmup_steps: 6800
+  warmup_steps: 2300
   lr_scheduler_type: cosine
   per_device_train_batch_size: 8
   per_device_eval_batch_size: 8
