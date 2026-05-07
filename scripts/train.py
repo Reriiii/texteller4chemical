@@ -124,7 +124,7 @@ class StableTqdmProgressCallback(TrainerCallback):
         remaining_steps = max(1, state.max_steps - state.global_step)
         total = min(self.steps_per_epoch or remaining_steps, remaining_steps)
         current_epoch = min(
-            int(math.floor(state.epoch or 0.0)) + 1,
+            int(state.global_step // max(1, self.steps_per_epoch)) + 1,
             int(math.ceil(args.num_train_epochs)),
         )
         desc = f"Epoch {current_epoch}/{int(math.ceil(args.num_train_epochs))}"
