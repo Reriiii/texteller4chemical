@@ -1,8 +1,8 @@
 seed: 42
-max_target_length: 768
+max_target_length: 1536
 
 data:
-  target_length_policy: filter
+  target_length_policy: error
 
 image_size:
   height: 448
@@ -31,23 +31,28 @@ sampling:
         weight: 1.5
       - max_length: 768
         weight: 3.0
+      - max_length: 1536
+        weight: 4.0
       - max_length: null
-        weight: 2.0
+        weight: 4.0
 
 training:
-  num_train_epochs: 30
+  num_train_epochs: 150
   learning_rate: 3.0e-5
   weight_decay: 0.01
-  warmup_steps: 2650
+  warmup_steps: 6800
   lr_scheduler_type: cosine
-  per_device_train_batch_size: 2
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 8
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 1
   max_grad_norm: 1.0
   fp16: false
   bf16: true
   gradient_checkpointing: false
-  dataloader_num_workers: 2
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
   logging_steps: 100
   logging_strategy: epoch
   logging_first_step: false
