@@ -1,97 +1,61 @@
 # AGENTS.md
 
-Guidance for coding agents working on this repository.
+## Defaults
+- This repo fine-tunes/domain-adapts pretrained TexTeller for EDU-CHEMC / EDU-CHMEC_MM23 handwritten chemical images to chemical markup.
+- Default base model is `OleehyO/TexTeller`; do not require Tex80M or train from scratch unless the user explicitly changes scope.
+- Current graph-eval target is `ssml_normed`; `ssml_sd` is only a legacy/simple sequence baseline, and `ssml_rcgd` is not suitable for the normal sequence decoder.
+- Keep TexTeller preprocessing at grayscale `448x448x1`; configs set `image_size.height: 448`, `width: 448`, `channels: 1`.
+- Use `configs/train_edu_chemc.yaml` for the active experiment: `max_target_length: 768`, bf16, encoder frozen, LoRA r32 over encoder+decoder, length-balanced sampling, 30 epochs.
+- `configs/train_edu_chemc_baseline.yaml` is the older 20-epoch decoder-only LoRA r16 baseline for comparison.
 
-## Project Goal
+## Data Pipeline
+- User target runtime is a Linux GPU server with this flow: download Hugging Face data -> prepare data -> train -> evaluate with GraphMatchingTool.
+- Hugging Face dataset id is `ConstantHao/EDU-CHEMC_MM23`; use `datasets.load_dataset("ConstantHao/EDU-CHEMC_MM23")` when adding/using a download stage.
+- The HF dataset card exposes splits `train`, `val`, `test` and fields `image`, `chemfig`, `ssml_sd`, `ssml_normed`, `ssml_rcgd`, `image_path`; total size is about 53k rows / 28.9 GB.
+- `scripts/run_edu_chemc_pipeline.py` is the end-to-end Linux GPU launcher for download -> materialize -> analyze -> train -> graph-evaluate.
+- `scripts/materialize_hf_edu_chemc.py` uses `load_dataset`, preserves official HF splits, and maps HF `val` to repo split name `validation`.
+- Cache-only HF download command: `uv run python -c "from datasets import load_dataset; load_dataset('ConstantHao/EDU-CHEMC_MM23')"`; this does not create the prepared imagefolder metadata used by training.
+- `scripts/prepare_edu_chemc.py` is only for a local image tree with same-stem `.json` annotations; it creates its own random split, so do not use it when official HF splits matter.
+- Graph eval needs `targets.ssml_normed` in prepared `metadata.jsonl`; re-run prepare with `--target_field ssml_normed` if `evaluate.py --graph_eval` complains about missing graph labels.
+- For local-tree prepare on read-only mounts, `--copy_mode reference` writes absolute source image paths instead of copying images.
 
-This project fine-tunes and domain-adapts pretrained TexTeller for handwritten chemical formula and chemical structure recognition on EDU-CHEMC / EDU-CHMEC_MM23.
+## Setup And Checks
+- Standard local setup is `uv sync`; `pyproject.toml` routes `torch`/`torchvision` to the explicit `pytorch-cu130` uv index.
+- On managed GPU servers, avoid accidentally replacing the system CUDA PyTorch; install through the server workflow, then use `pip install -e . --no-deps` for this repo if needed.
+- Check CUDA before training: `uv run python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.version.cuda); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')"`.
+- `training.bf16: true` requires a bf16-capable CUDA GPU; otherwise switch the config to fp16 or fp32 before launch.
 
-The intended pipeline is:
-
-```text
-handwritten chemical image -> pretrained TexTeller -> chemical markup sequence
-```
-
-## Non-Negotiable Constraints
-
-- Do not require Tex80M.
-- Do not train TexTeller from scratch by default.
-- Treat this as fine-tuning / domain adaptation from pretrained TexTeller.
-- Use `OleehyO/TexTeller` as the default model.
-- Use `ssml_normed` for current paper-style graph-based EDU-CHEMC experiments.
-- Treat `ssml_sd` as a legacy/simple sequence baseline target, not the current best target.
-- Do not use `ssml_rcgd` for the baseline sequence decoder unless explicitly requested.
-- EDU-CHEMC targets are chemical markup, not ordinary math LaTeX.
-
-## Model Facts
-
-`OleehyO/TexTeller` is loaded through Hugging Face-compatible APIs when possible.
-
-Observed default properties:
-
-- encoder: ViT
-- decoder: TrOCR-like
-- input image: grayscale
-- channels: 1
-- image size: `448x448`
-- default config: `configs/train_edu_chemc.yaml`
-- baseline/reference config: `configs/train_edu_chemc_baseline.yaml`
-
-Keep preprocessing aligned with:
-
-```yaml
-image_size:
-  height: 448
-  width: 448
-  channels: 1
-```
-
-## Repository Structure
-
-```text
-configs/train_edu_chemc.yaml
-configs/train_edu_chemc_baseline.yaml
-scripts/prepare_edu_chemc.py
-scripts/analyze_targets.py
-scripts/analyze_tokenizer_coverage.py
-scripts/train.py
-scripts/evaluate.py
-scripts/predict.py
-src/chemtexteller/data.py
-src/chemtexteller/transforms.py
-src/chemtexteller/tokenizer_utils.py
-src/chemtexteller/model_loader.py
-src/chemtexteller/metrics.py
-src/chemtexteller/utils.py
-```
-
-## Standard Workflow
-
-Prepare data for the current graph-based experiment:
+## Core Commands
+Full server pipeline:
 
 ```bash
-uv run python scripts/prepare_edu_chemc.py \
-  --src_dir /path/to/EDU-CHMEC_MM23 \
+uv run python scripts/run_edu_chemc_pipeline.py \
+  --stages all \
+  --graph_matching_tool_dir external/GraphMatchingTool
+```
+
+Materialize current graph target from Hugging Face:
+
+```bash
+uv run python scripts/materialize_hf_edu_chemc.py \
+  --dataset_id ConstantHao/EDU-CHEMC_MM23 \
   --out_dir data/processed/edu_chemc_normed \
   --target_field ssml_normed
 ```
 
-Analyze targets:
+Analyze before serious training:
 
 ```bash
 uv run python scripts/analyze_targets.py \
   --metadata data/processed/edu_chemc_normed/train/metadata.jsonl
-```
 
-Analyze tokenizer coverage:
-
-```bash
 uv run python scripts/analyze_tokenizer_coverage.py \
   --metadata data/processed/edu_chemc_normed/train/metadata.jsonl \
-  --pretrained_model_name_or_path OleehyO/TexTeller
+  --pretrained_model_name_or_path OleehyO/TexTeller \
+  --max_decoder_length 768
 ```
 
-Fine-tune:
+Train on a single Linux GPU node:
 
 ```bash
 uv run accelerate launch \
@@ -120,178 +84,24 @@ uv run python scripts/evaluate.py \
   --graph_eval \
   --graph_matching_tool_dir external/GraphMatchingTool \
   --graph_label_key ssml_normed \
-  --graph_num_workers 0 \
-  --graph_keep_temp
+  --graph_num_workers 8
 ```
 
-Predict one image:
+## GraphMatchingTool
+- `scripts/evaluate.py --graph_eval` requires `external/GraphMatchingTool/eval.py`; `external/` is gitignored, so clone/install it locally on the server.
+- GraphMatchingTool is invoked with the same Python executable running `evaluate.py`; install its dependencies in that environment, for example `python-Levenshtein` if the tool needs it.
+- Metric mapping in `src/chemtexteller/graph_matching_eval.py`: `struct.line -> graph_em`, `struct -> graph_structure_em`, `base -> graph_base_sent_acc`.
+- On Windows use `--graph_num_workers 0` to avoid multiprocessing issues; on Linux GPU servers the default/`8` workers is the intended path.
 
-```bash
-uv run python scripts/predict.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep/best \
-  --image_path /path/to/image.png
-```
+## Model And Tokenizer Quirks
+- `src/chemtexteller/model_loader.py` intentionally tries Hugging Face tokenizer/processor/model classes, optional `texteller`, then PEFT adapters; do not hard-code an unverified TexTeller internal API.
+- PEFT `best/` checkpoints can be adapter-only; evaluation loads the base model from `adapter_config.json` and merges LoRA unless `--no_merge_lora` is passed.
+- Run tokenizer coverage before long runs; chemical tokens such as `branch`, `?[a]`, angle bonds, atoms, rings, and ChemFig-like macros may be poorly covered by the math tokenizer.
+- If extending the tokenizer, the decoder embeddings/output projection must resize successfully; `resize_token_embeddings_if_needed` raises if that cannot happen.
+- `data.target_length_policy: filter` drops samples above `max_target_length`; do not lower `max_target_length` without checking truncation/coverage stats.
 
-Legacy `ssml_sd` baseline workflow is still useful for debugging a simpler sequence target, but it is not the current best path for graph-based EM.
-
-## Environment Notes
-
-The runtime may install CPU-only PyTorch unless CUDA wheels are selected explicitly. Check CUDA with:
-
-```bash
-uv run python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.version.cuda); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')"
-```
-
-When VRAM is limited, prefer:
-
-- small per-device batch size
-- gradient accumulation
-- encoder freezing
-- LoRA
-- shorter target length only after checking truncation risk
-
-## Managed GPU Environments
-
-Avoid reinstalling PyTorch accidentally in managed notebook environments. Install dependencies through the environment's preferred workflow, then use `pip install -e . --no-deps` for this repo.
-
-For read-only dataset mounts:
-
-```bash
-uv run python scripts/prepare_edu_chemc.py \
-  --src_dir /path/to/EDU-CHMEC_MM23 \
-  --out_dir data/processed/edu_chemc_normed \
-  --target_field ssml_normed \
-  --copy_mode reference
-```
-
-Use `configs/train_edu_chemc.yaml` unless the user explicitly asks for a smaller custom managed-GPU config.
-
-## Tokenizer And Target Guidance
-
-Current recommended target for graph-based evaluation:
-
-```text
-ssml_normed
-```
-
-Why:
-
-- GraphMatchingTool expects labels in `ssml_normed`.
-- Training directly on `ssml_normed` greatly improved graph-based metrics.
-- It still fits the standard encoder-decoder baseline and avoids the conditional/reconnection mechanism required by `ssml_rcgd`.
-
-Known local results:
-
-```text
-ssml_sd 10ep LoRA r16 full test:
-  Graph EM:      4.74%
-  Structure EM:  6.11%
-
-ssml_normed 20ep LoRA r16 full test, greedy:
-  Graph EM:     30.08%  (1594/5299)
-  Structure EM: 34.97%  (1853/5299)
-  String EM:     6.61%  (350/5299)
-
-ssml_normed 20ep LoRA r16 test500, beam3:
-  Graph EM:     32.40%
-  Structure EM: 37.00%
-```
-
-Tradeoffs:
-
-- `ssml_normed` sequences are longer than `ssml_sd`.
-- With TexTeller tokenizer, `ssml_normed` train targets averaged about 268 tokens vs about 182 for `ssml_sd`.
-- `configs/train_edu_chemc.yaml` uses `max_target_length: 768`, LoRA r32 over encoder+decoder, and length-balanced sampling to focus more on long targets.
-- `configs/train_edu_chemc_baseline.yaml` preserves the older 20ep decoder-only LoRA r16 baseline for comparison.
-
-Tokenizer risks:
-
-- Chemical tokens such as `branch`, `?[a]`, `-[:30]`, `=[:180]`, `<:[:270]`, atoms, rings, and ChemFig-like macros may be poorly covered by the original math tokenizer.
-- Always run tokenizer coverage before serious training.
-- If extending the tokenizer, make sure decoder embeddings and output projection are resized.
-
-## Model Loader Guidance
-
-Model loading is intentionally defensive in:
-
-```text
-src/chemtexteller/model_loader.py
-```
-
-It tries:
-
-1. Hugging Face tokenizer / processor
-2. `AutoModelForVision2Seq` when available
-3. `VisionEncoderDecoderModel`
-4. optional package `texteller`
-5. PEFT adapters when loading LoRA checkpoints
-
-Do not hard-code an unverified TexTeller internal API. If the Hugging Face model loads, prefer the standard Hugging Face path.
-
-PEFT checkpoints saved in `best/` are adapter-only directories. Loading `outputs/runs/.../best` should load the base model recorded in `adapter_config.json` and then attach the LoRA adapter.
-
-## Evaluation Guidance
-
-Use `scripts/evaluate.py --graph_eval` for paper-style metrics. GraphMatchingTool reports:
-
-```text
-struct.line -> graph_em
-struct      -> graph_structure_em
-base        -> string sentence accuracy reference
-```
-
-GraphMatchingTool is kept as a local external clone under `external/GraphMatchingTool`, which is intentionally gitignored. Install its dependencies locally as needed, for example `python-Levenshtein`.
-
-On Windows, prefer `--graph_num_workers 0`. This avoids multiprocessing/Manager permission issues and was fast enough for the full EDU-CHEMC test set.
-
-Greedy decoding is the full-test baseline. Beam search can help; `num_beams 3` improved test500 graph EM from `30.2%` to `32.4%` for the 20ep `ssml_normed` model.
-
-## Logging And Artifacts
-
-Training writes run logs to `logs/`:
-
-```text
-logs/<run_name>_<timestamp>.log
-logs/<run_name>_<timestamp>.trainer_events.jsonl
-```
-
-The default config logs by epoch and evaluates/saves every five epochs. Keep large generated artifacts out of git:
-
-```text
-data/
-outputs/
-logs/
-external/
-.uv-cache/
-.uv-python/
-.venv/
-```
-
-For a clean handoff, keep only the important adapter directory and final eval metrics, for example:
-
-```text
-outputs/runs/edu_chemc_texteller_normed_lora16_bf16_20ep/best
-outputs/eval_normed_lora16_20ep_test_greedy.metrics.json
-outputs/eval_normed_lora16_20ep_test_greedy.graph_result.txt
-```
-
-## Code Quality Rules
-
-- Use `pathlib`.
-- Keep scripts runnable with `uv run python ...`.
-- Do not hard-code local paths except generic examples in docs.
-- Do not silently switch experiments back to `ssml_sd`; use `ssml_normed` for paper-style graph EM unless the user explicitly asks for the legacy baseline.
-- Do not silently swallow dataset/model loading errors.
-- Preserve clear error messages for missing checkpoints, tokenizer resize failures, and bad dataset rows.
-- Prefer small, focused changes.
-- Avoid notebook-only workflows.
-
-## Common Failure Modes
-
-- CPU-only PyTorch installed even though CUDA is available.
-- Image channel mismatch: TexTeller expects 1-channel grayscale input.
-- Tokenizer extended but decoder embedding/output projection not resized.
-- `ssml_rcgd` used with a normal sequence decoder.
-- Chemical target truncated by too-small `max_target_length`.
-- Augmentation too strong and changes bond topology.
-- Full fine-tuning OOM on limited VRAM.
+## Verification And Artifacts
+- No test suite, lint config, formatter config, CI, or pre-commit config is present; verify changes with the smallest relevant script command, often `evaluate.py --max_samples N` after a checkpoint exists.
+- Training writes logs to `logs/<run_name>_<timestamp>.log` and trainer events to `logs/<run_name>_<timestamp>.trainer_events.jsonl`.
+- Keep generated `data/`, `outputs/`, `logs/`, `external/`, `.uv-cache/`, `.uv-python/`, and `.venv/` out of git.
+- Keep scripts runnable as `uv run python ...`, use `pathlib`, and avoid hard-coded local paths except generic examples in docs.

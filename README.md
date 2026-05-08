@@ -36,7 +36,30 @@ uv sync
 
 For managed GPU environments, avoid reinstalling PyTorch unless needed. Install project dependencies from the environment's preferred package workflow, then use `pip install -e . --no-deps` for this repo.
 
+## End-To-End Server Pipeline
+
+On a Linux GPU server, this runs the intended flow: Hugging Face download, materialize official splits, analyze, train, then evaluate with GraphMatchingTool.
+
+```bash
+uv run python scripts/run_edu_chemc_pipeline.py \
+  --stages all \
+  --graph_matching_tool_dir external/GraphMatchingTool
+```
+
+For a smoke run, add `--max_samples_per_split N --eval_max_samples N` and omit `train` from `--stages` unless a checkpoint already exists.
+
 ## Prepare Data
+
+Preferred Hugging Face path, preserving official `train`/`val`/`test` splits and mapping `val` to repo split `validation`:
+
+```bash
+uv run python scripts/materialize_hf_edu_chemc.py \
+  --dataset_id ConstantHao/EDU-CHEMC_MM23 \
+  --out_dir data/processed/edu_chemc_normed \
+  --target_field ssml_normed
+```
+
+Legacy local image + same-stem JSON tree path:
 
 ```bash
 uv run python scripts/prepare_edu_chemc.py \
@@ -45,7 +68,7 @@ uv run python scripts/prepare_edu_chemc.py \
   --target_field ssml_normed
 ```
 
-For read-only dataset mounts, add:
+For read-only local-tree dataset mounts, add:
 
 ```bash
 --copy_mode reference
@@ -59,7 +82,8 @@ uv run python scripts/analyze_targets.py \
 
 uv run python scripts/analyze_tokenizer_coverage.py \
   --metadata data/processed/edu_chemc_normed/train/metadata.jsonl \
-  --pretrained_model_name_or_path OleehyO/TexTeller
+  --pretrained_model_name_or_path OleehyO/TexTeller \
+  --max_decoder_length 768
 ```
 
 ## Train
@@ -98,8 +122,7 @@ uv run python scripts/evaluate.py \
   --graph_eval \
   --graph_matching_tool_dir external/GraphMatchingTool \
   --graph_label_key ssml_normed \
-  --graph_num_workers 0 \
-  --graph_keep_temp
+  --graph_num_workers 8
 ```
 
 Built-in metrics include exact match, normalized exact match, token edit distance, normalized token edit distance, character edit distance, and length stats. With `--graph_eval`, GraphMatchingTool also reports graph EM and structure EM.

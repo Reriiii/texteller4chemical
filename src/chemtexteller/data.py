@@ -128,12 +128,17 @@ class EduChemcDataset(Dataset[dict[str, Any]]):
             "metadata_targets": sample.targets,
         }
         if self.tokenize_targets:
+            truncation = self.target_length_policy.lower() == "truncate"
+            tokenizer_kwargs: dict[str, Any] = {
+                "truncation": truncation,
+                "padding": False,
+                "add_special_tokens": True,
+            }
+            if truncation:
+                tokenizer_kwargs["max_length"] = self.max_target_length
             tokenized = self.tokenizer(
                 sample.target,
-                max_length=self.max_target_length,
-                truncation=True,
-                padding=False,
-                add_special_tokens=True,
+                **tokenizer_kwargs,
             )
             item["labels"] = tokenized["input_ids"]
         return item
