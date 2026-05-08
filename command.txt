@@ -1,0 +1,17 @@
+export CUDA_VISIBLE_DEVICES=1
+export HF_HOME=/home/tuancuong/data5t/chemteller/.hf_cache
+export HF_HUB_CACHE=/home/tuancuong/data5t/chemteller/.hf_cache/hub
+export TRANSFORMERS_CACHE=/home/tuancuong/data5t/chemteller/.hf_cache/transformers
+export UV_CACHE_DIR=/home/tuancuong/data5t/chemteller/.uv-cache
+export UV_PYTHON_INSTALL_DIR=/home/tuancuong/data5t/chemteller/.uv-python
+
+uv run accelerate launch \
+  --num_machines 1 \
+  --num_processes 1 \
+  --mixed_precision bf16 \
+  --dynamo_backend no \
+  scripts/train.py \
+  --config configs/train_edu_chemc.yaml \
+  --dataset_dir data/processed/edu_chemc_normed \
+  --pretrained_model_name_or_path OleehyO/TexTeller \
+  --output_dir outputs/runs/edu_chemc_texteller_textellerpre_full_decoder_bf16_30ep
