@@ -9,8 +9,12 @@ image_size:
   width: 448
   channels: 1
   pad_value: 255
-  normalize_mean: null
-  normalize_std: null
+  trim_white_border: true
+  trim_threshold: 15
+  resize_mode: texteller
+  pad_position: top_left
+  normalize_mean: 0.9545467
+  normalize_std: 0.15394445
 
 augmentation:
   enabled: true
