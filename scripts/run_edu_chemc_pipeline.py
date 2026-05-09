@@ -14,10 +14,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_ID = "ConstantHao/EDU-CHEMC_MM23"
 DEFAULT_DATASET_DIR = Path("data/processed/edu_chemc_normed")
 DEFAULT_OUTPUT_DIR = Path(
-    "outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep"
+    "outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep"
 )
-DEFAULT_EVAL_CSV = Path("outputs/eval_normed_len768_r32_all_lora_balanced_30ep_test_greedy.csv")
+DEFAULT_EVAL_CSV = Path("outputs/eval_textellerpre_full_model_bf16_30ep_test_greedy.csv")
 STAGE_ORDER = ("download", "prepare", "analyze", "train", "evaluate")
+STAGE_ALIASES = ("all", "train_eval")
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,9 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stages",
         nargs="+",
-        choices=["all", *STAGE_ORDER],
+        choices=[*STAGE_ALIASES, *STAGE_ORDER],
         default=["all"],
-        help="Stages to run; selected stages always execute in pipeline order.",
+        help=(
+            "Stages to run; selected stages always execute in pipeline order. "
+            "Use train_eval to train, then evaluate the resulting best checkpoint."
+        ),
     )
     parser.add_argument("--dataset_id", type=str, default=DEFAULT_DATASET_ID)
     parser.add_argument("--dataset_config", type=str, default=None)
@@ -53,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--eval_max_samples", type=int, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=768)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--dtype", choices=["auto", "fp32", "fp16", "bf16"], default="bf16")
     parser.add_argument("--graph_matching_tool_dir", type=Path, default=Path("external/GraphMatchingTool"))
     parser.add_argument("--graph_num_workers", type=int, default=8)
@@ -67,6 +71,8 @@ def parse_args() -> argparse.Namespace:
 def selected_stages(values: list[str]) -> list[str]:
     if "all" in values:
         return list(STAGE_ORDER)
+    if "train_eval" in values:
+        values = [*values, "train", "evaluate"]
     requested = set(values)
     return [stage for stage in STAGE_ORDER if stage in requested]
 

@@ -15,12 +15,13 @@ CACHE_DIR=${CACHE_DIR:-${PROJECT_ROOT}/data/hf_cache/datasets}
 TARGET_FIELD=${TARGET_FIELD:-ssml_normed}
 CONFIG=${CONFIG:-configs/train_edu_chemc.yaml}
 PRETRAINED_MODEL=${PRETRAINED_MODEL:-OleehyO/TexTeller}
-OUTPUT_DIR=${OUTPUT_DIR:-outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep}
-EVAL_OUTPUT_CSV=${EVAL_OUTPUT_CSV:-outputs/eval_normed_len768_r32_all_lora_balanced_30ep_test_greedy.csv}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep}
+EVAL_OUTPUT_CSV=${EVAL_OUTPUT_CSV:-outputs/eval_textellerpre_full_model_bf16_30ep_test_greedy.csv}
 GRAPH_MATCHING_TOOL_DIR=${GRAPH_MATCHING_TOOL_DIR:-external/GraphMatchingTool}
 GRAPH_NUM_WORKERS=${GRAPH_NUM_WORKERS:-8}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 DTYPE=${DTYPE:-bf16}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
 
 export HF_HOME=${HF_HOME:-${PROJECT_ROOT}/data/hf_cache}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${CACHE_DIR}}
@@ -40,4 +41,5 @@ uv run python scripts/run_edu_chemc_pipeline.py \
   --graph_num_workers "${GRAPH_NUM_WORKERS}" \
   --mixed_precision "${MIXED_PRECISION}" \
   --dtype "${DTYPE}" \
+  --max_new_tokens "${MAX_NEW_TOKENS}" \
   "$@"

@@ -5,7 +5,7 @@
 - Default base model is `OleehyO/TexTeller`; do not require Tex80M or train from scratch unless the user explicitly changes scope.
 - Current graph-eval target is `ssml_normed`; `ssml_sd` is only a legacy/simple sequence baseline, and `ssml_rcgd` is not suitable for the normal sequence decoder.
 - Keep TexTeller preprocessing at grayscale `448x448x1`; configs set `image_size.height: 448`, `width: 448`, `channels: 1`.
-- Use `configs/train_edu_chemc.yaml` for the active experiment: `max_target_length: 768`, bf16, encoder frozen, LoRA r32 over encoder+decoder, length-balanced sampling, 30 epochs.
+- Use `configs/train_edu_chemc.yaml` for the active experiment: `max_target_length: 1024`, TexTeller-aligned preprocessing, bf16, LoRA disabled, full-model fine-tuning with encoder unfrozen, length-balanced sampling, 30 epochs.
 - `configs/train_edu_chemc_baseline.yaml` is the older 20-epoch decoder-only LoRA r16 baseline for comparison.
 
 ## Data Pipeline
@@ -26,11 +26,11 @@
 - `training.bf16: true` requires a bf16-capable CUDA GPU; otherwise switch the config to fp16 or fp32 before launch.
 
 ## Core Commands
-Full server pipeline:
+Train then evaluate on the current prepared dataset:
 
 ```bash
 uv run python scripts/run_edu_chemc_pipeline.py \
-  --stages all \
+  --stages train_eval \
   --graph_matching_tool_dir external/GraphMatchingTool
 ```
 
@@ -52,7 +52,7 @@ uv run python scripts/analyze_targets.py \
 uv run python scripts/analyze_tokenizer_coverage.py \
   --metadata data/processed/edu_chemc_normed/train/metadata.jsonl \
   --pretrained_model_name_or_path OleehyO/TexTeller \
-  --max_decoder_length 768
+  --max_decoder_length 1024
 ```
 
 Train on a single Linux GPU node:
@@ -66,21 +66,21 @@ uv run accelerate launch \
   --config configs/train_edu_chemc.yaml \
   --dataset_dir data/processed/edu_chemc_normed \
   --pretrained_model_name_or_path OleehyO/TexTeller \
-  --output_dir outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep
+  --output_dir outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep
 ```
 
 Evaluate with paper-style graph matching:
 
 ```bash
 uv run python scripts/evaluate.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller_normed_len768_r32_all_lora_balanced_30ep/best \
+  --model_ckpt outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep/best \
   --dataset_dir data/processed/edu_chemc_normed \
   --split test \
   --batch_size 8 \
   --num_beams 1 \
-  --max_new_tokens 768 \
+  --max_new_tokens 1024 \
   --dtype bf16 \
-  --output_csv outputs/eval_normed_len768_r32_all_lora_balanced_30ep_test_greedy.csv \
+  --output_csv outputs/eval_textellerpre_full_model_bf16_30ep_test_greedy.csv \
   --graph_eval \
   --graph_matching_tool_dir external/GraphMatchingTool \
   --graph_label_key ssml_normed \
