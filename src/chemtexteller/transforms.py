@@ -45,6 +45,7 @@ class ImagePreprocessConfig:
     min_augmented_size: int = 30
     augraphy_enabled: bool = False
     max_augmentation_side: int = 4096
+    log_augmentation_downscale: bool = False
 
 
 def _as_tuple(value: Any, channels: int) -> tuple[float, ...] | None:
@@ -91,6 +92,7 @@ def image_config_from_dict(config: dict[str, Any]) -> ImagePreprocessConfig:
         min_augmented_size=int(aug.get("min_augmented_size", 30)),
         augraphy_enabled=bool(aug.get("augraphy_enabled", False)),
         max_augmentation_side=int(aug.get("max_augmentation_side", 4096)),
+        log_augmentation_downscale=bool(aug.get("log_augmentation_downscale", False)),
     )
 
 
@@ -265,6 +267,8 @@ class ResizePadTransform:
             max(1, int(round(image.width * scale))),
             max(1, int(round(image.height * scale))),
         )
+        if not self.cfg.log_augmentation_downscale:
+            return image.resize(new_size, Image.Resampling.LANCZOS)
         if self._oversized_augmentation_count <= 3:
             logger.info(
                 "Downscaling oversized image before Augraphy: %sx%s -> %sx%s",
