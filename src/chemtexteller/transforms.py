@@ -168,6 +168,7 @@ class ResizePadTransform:
             ratio=(0.3, 3.3),
             value=1.0,
         )
+        self._oversized_augmentation_count = 0
 
     def __call__(self, image: Image.Image) -> torch.Tensor:
         mode = "RGB" if self.cfg.channels == 3 else "L"
@@ -258,18 +259,24 @@ class ResizePadTransform:
         current_side = max(image.size)
         if current_side <= max_side:
             return image
+        self._oversized_augmentation_count += 1
         scale = max_side / current_side
         new_size = (
             max(1, int(round(image.width * scale))),
             max(1, int(round(image.height * scale))),
         )
-        logger.warning(
-            "Downscaling oversized image before Augraphy: %sx%s -> %sx%s",
-            image.width,
-            image.height,
-            new_size[0],
-            new_size[1],
-        )
+        if self._oversized_augmentation_count <= 3:
+            logger.info(
+                "Downscaling oversized image before Augraphy: %sx%s -> %sx%s",
+                image.width,
+                image.height,
+                new_size[0],
+                new_size[1],
+            )
+        elif self._oversized_augmentation_count == 4:
+            logger.info(
+                "Further oversized Augraphy downscale messages are suppressed."
+            )
         return image.resize(new_size, Image.Resampling.LANCZOS)
 
     def _random_resize(self, image: Image.Image) -> Image.Image:
