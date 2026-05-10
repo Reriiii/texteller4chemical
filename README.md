@@ -24,7 +24,7 @@ configs/train_edu_chemc.yaml
 configs/train_edu_chemc_baseline.yaml
 ```
 
-`configs/train_edu_chemc.yaml` is the active experiment: `max_target_length: 1024`, TexTeller-aligned preprocessing, full-model fine-tuning with encoder unfrozen, bf16, and length-balanced sampling.
+`configs/train_edu_chemc.yaml` is the active experiment: `max_target_length: 1024`, TexTeller-aligned preprocessing, TexTeller OCR/Augraphy augmentation, full-model fine-tuning with encoder unfrozen, bf16, and length-balanced sampling.
 
 `configs/train_edu_chemc_baseline.yaml` preserves the earlier 20-epoch decoder-only LoRA r16 baseline for comparison.
 

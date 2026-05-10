@@ -18,6 +18,14 @@ image_size:
 
 augmentation:
   enabled: true
+  profile: texteller_ocr
+  random_resize_min: 0.75
+  random_resize_max: 1.15
+  rotate_prob: 0.20
+  rotate_degrees: 5.0
+  random_border_max: 25
+  min_augmented_size: 30
+  augraphy_enabled: true
   brightness: 0.05
   contrast: 0.05
   gaussian_blur_prob: 0.02

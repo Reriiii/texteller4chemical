@@ -18,6 +18,7 @@ image_size:
 
 augmentation:
   enabled: true
+  profile: light
   brightness: 0.08
   contrast: 0.08
   gaussian_blur_prob: 0.03

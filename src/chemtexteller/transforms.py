@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+import random
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as F
@@ -29,12 +30,20 @@ class ImagePreprocessConfig:
     normalize_mean: tuple[float, ...] | None = None
     normalize_std: tuple[float, ...] | None = None
     augmentation_enabled: bool = False
+    augmentation_profile: str = "light"
     brightness: float = 0.10
     contrast: float = 0.10
     gaussian_blur_prob: float = 0.05
     affine_degrees: float = 2.0
     affine_translate: float = 0.02
     random_erasing_prob: float = 0.0
+    random_resize_min: float = 0.75
+    random_resize_max: float = 1.15
+    rotate_prob: float = 0.20
+    rotate_degrees: float = 5.0
+    random_border_max: int = 25
+    min_augmented_size: int = 30
+    augraphy_enabled: bool = False
 
 
 def _as_tuple(value: Any, channels: int) -> tuple[float, ...] | None:
@@ -66,12 +75,20 @@ def image_config_from_dict(config: dict[str, Any]) -> ImagePreprocessConfig:
         normalize_mean=_as_tuple(image.get("normalize_mean"), channels),
         normalize_std=_as_tuple(image.get("normalize_std"), channels),
         augmentation_enabled=bool(aug.get("enabled", False)),
+        augmentation_profile=str(aug.get("profile", "light")),
         brightness=float(aug.get("brightness", 0.10)),
         contrast=float(aug.get("contrast", 0.10)),
         gaussian_blur_prob=float(aug.get("gaussian_blur_prob", 0.05)),
         affine_degrees=float(aug.get("affine_degrees", 2.0)),
         affine_translate=float(aug.get("affine_translate", 0.02)),
         random_erasing_prob=float(aug.get("random_erasing_prob", 0.0)),
+        random_resize_min=float(aug.get("random_resize_min", 0.75)),
+        random_resize_max=float(aug.get("random_resize_max", 1.15)),
+        rotate_prob=float(aug.get("rotate_prob", 0.20)),
+        rotate_degrees=float(aug.get("rotate_degrees", 5.0)),
+        random_border_max=int(aug.get("random_border_max", 25)),
+        min_augmented_size=int(aug.get("min_augmented_size", 30)),
+        augraphy_enabled=bool(aug.get("augraphy_enabled", False)),
     )
 
 
@@ -107,13 +124,25 @@ class ResizePadTransform:
     def __init__(self, cfg: ImagePreprocessConfig, train: bool = False) -> None:
         self.cfg = cfg
         self.train = train
-        use_augmentation = train and cfg.augmentation_enabled
+        self.augmentation_profile = cfg.augmentation_profile.lower()
+        if self.augmentation_profile in {"texteller", "texteller_ocr", "ocr"}:
+            self.augmentation_profile = "texteller_ocr"
+        if self.augmentation_profile not in {"light", "texteller_ocr", "none"}:
+            raise ValueError(
+                "augmentation.profile must be 'light', 'texteller_ocr', or 'none'."
+            )
+        self._augraphy_pipeline: Any | None = None
+        use_light_augmentation = (
+            train
+            and cfg.augmentation_enabled
+            and self.augmentation_profile == "light"
+        )
         self.color_jitter = (
             transforms.ColorJitter(
                 brightness=cfg.brightness,
                 contrast=cfg.contrast,
             )
-            if use_augmentation and (cfg.brightness > 0 or cfg.contrast > 0)
+            if use_light_augmentation and (cfg.brightness > 0 or cfg.contrast > 0)
             else None
         )
         self.random_affine = (
@@ -123,12 +152,12 @@ class ResizePadTransform:
                 interpolation=InterpolationMode.BILINEAR,
                 fill=cfg.pad_value,
             )
-            if use_augmentation and (cfg.affine_degrees > 0 or cfg.affine_translate > 0)
+            if use_light_augmentation and (cfg.affine_degrees > 0 or cfg.affine_translate > 0)
             else None
         )
         self.gaussian_blur = (
             transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.6))
-            if use_augmentation and cfg.gaussian_blur_prob > 0
+            if use_light_augmentation and cfg.gaussian_blur_prob > 0
             else None
         )
         self.random_erasing = transforms.RandomErasing(
@@ -142,20 +171,38 @@ class ResizePadTransform:
         mode = "RGB" if self.cfg.channels == 3 else "L"
         image = image.convert("RGB")
 
-        if self.cfg.trim_white_border:
-            image = self._trim_white_border(image)
+        if (
+            self.train
+            and self.cfg.augmentation_enabled
+            and self.augmentation_profile == "texteller_ocr"
+        ):
+            image = self._augment_texteller_ocr(image)
+        else:
+            if self.cfg.trim_white_border:
+                image = self._trim_white_border(image)
+
+            image = image.convert(mode)
+
+            if (
+                self.train
+                and self.cfg.augmentation_enabled
+                and self.augmentation_profile == "light"
+            ):
+                image = self._augment_pil(image)
+                if self.cfg.trim_white_border:
+                    image = self._trim_white_border(image).convert(mode)
 
         image = image.convert(mode)
-
-        if self.train and self.cfg.augmentation_enabled:
-            image = self._augment_pil(image)
-            if self.cfg.trim_white_border:
-                image = self._trim_white_border(image).convert(mode)
 
         image = self._resize_and_pad(image)
         tensor = F.to_tensor(image)
 
-        if self.train and self.cfg.augmentation_enabled and self.cfg.random_erasing_prob > 0:
+        if (
+            self.train
+            and self.cfg.augmentation_enabled
+            and self.augmentation_profile == "light"
+            and self.cfg.random_erasing_prob > 0
+        ):
             tensor = self.random_erasing(tensor)
 
         if self.cfg.normalize_mean is not None and self.cfg.normalize_std is not None:
@@ -171,6 +218,88 @@ class ResizePadTransform:
             if torch.rand(1).item() < self.cfg.gaussian_blur_prob:
                 image = self.gaussian_blur(image)
         return image
+
+    def _augment_texteller_ocr(self, image: Image.Image) -> Image.Image:
+        image = self._random_resize(image)
+        if self.cfg.trim_white_border:
+            image = self._trim_white_border(image)
+
+        if self.cfg.rotate_prob > 0 and random.random() < self.cfg.rotate_prob:
+            rotate_degrees = self.cfg.rotate_degrees
+            if float(rotate_degrees).is_integer():
+                angle = random.randint(-int(rotate_degrees), int(rotate_degrees))
+            else:
+                angle = random.uniform(-rotate_degrees, rotate_degrees)
+            image = image.rotate(
+                angle,
+                resample=Image.Resampling.BICUBIC,
+                expand=True,
+                fillcolor=(255, 255, 255),
+            )
+
+        image = self._add_white_border(image, self.cfg.random_border_max)
+
+        if self.cfg.augraphy_enabled:
+            image = self._apply_augraphy(image)
+
+        # TexTeller applies the normal inference transform after OCR augmentation;
+        # that transform trims the border again before grayscale/resize/pad.
+        if self.cfg.trim_white_border:
+            image = self._trim_white_border(image)
+        return image
+
+    def _random_resize(self, image: Image.Image) -> Image.Image:
+        min_ratio = self.cfg.random_resize_min
+        max_ratio = self.cfg.random_resize_max
+        if min_ratio <= 0 or max_ratio <= 0:
+            raise ValueError("random_resize_min/max must be positive.")
+        if min_ratio > max_ratio:
+            raise ValueError("random_resize_min must be <= random_resize_max.")
+        ratio = random.uniform(min_ratio, max_ratio)
+        if abs(ratio - 1.0) < 1e-6:
+            return image
+        new_w = max(1, int(image.width * ratio))
+        new_h = max(1, int(image.height * ratio))
+        return image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    def _add_white_border(self, image: Image.Image, max_size: int) -> Image.Image:
+        max_size = max(0, int(max_size))
+        left, top, right, bottom = [random.randint(0, max_size) for _ in range(4)]
+        pad_h = top + bottom
+        pad_w = left + right
+        if pad_h + image.height < self.cfg.min_augmented_size:
+            extra = int((self.cfg.min_augmented_size - (pad_h + image.height)) * 0.5) + 1
+            top += extra
+            bottom += extra
+        if pad_w + image.width < self.cfg.min_augmented_size:
+            extra = int((self.cfg.min_augmented_size - (pad_w + image.width)) * 0.5) + 1
+            left += extra
+            right += extra
+        return ImageOps.expand(
+            image.convert("RGB"),
+            border=(left, top, right, bottom),
+            fill=(255, 255, 255),
+        )
+
+    def _apply_augraphy(self, image: Image.Image) -> Image.Image:
+        pipeline = self._get_augraphy_pipeline()
+        arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        augmented = pipeline(arr)
+        if isinstance(augmented, tuple):
+            augmented = augmented[0]
+        if isinstance(augmented, list):
+            augmented = augmented[0]
+        augmented = np.asarray(augmented, dtype=np.uint8)
+        if augmented.ndim == 2:
+            return Image.fromarray(augmented).convert("RGB")
+        if augmented.ndim == 3 and augmented.shape[2] > 3:
+            augmented = augmented[:, :, :3]
+        return Image.fromarray(augmented).convert("RGB")
+
+    def _get_augraphy_pipeline(self) -> Any:
+        if self._augraphy_pipeline is None:
+            self._augraphy_pipeline = _build_texteller_augraphy_pipeline()
+        return self._augraphy_pipeline
 
     def _trim_white_border(self, image: Image.Image) -> Image.Image:
         arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
@@ -241,6 +370,147 @@ class ResizePadTransform:
         if pad_position == "center":
             return (self.cfg.width - new_w) // 2, (self.cfg.height - new_h) // 2
         raise ValueError("pad_position must be 'center' or 'top_left'.")
+
+
+def _build_texteller_augraphy_pipeline() -> Any:
+    try:
+        from augraphy import (
+            AugraphyPipeline,
+            Brightness,
+            BrightnessTexturize,
+            ColorShift,
+            DirtyDrum,
+            Dithering,
+            Gamma,
+            InkBleed,
+            InkColorSwap,
+            InkShifter,
+            Jpeg,
+            LightingGradient,
+            LinesDegradation,
+            NoiseTexturize,
+            OneOf,
+            SubtleNoise,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "augmentation.profile=texteller_ocr with augraphy_enabled=true requires "
+            "the 'augraphy' package. Install it with `uv add augraphy>=8.2.6` "
+            "or run `uv sync` after adding the dependency."
+        ) from exc
+
+    ink_phase = [
+        InkColorSwap(
+            ink_swap_color="random",
+            ink_swap_sequence_number_range=(5, 10),
+            ink_swap_min_width_range=(2, 3),
+            ink_swap_max_width_range=(100, 120),
+            ink_swap_min_height_range=(2, 3),
+            ink_swap_max_height_range=(100, 120),
+            ink_swap_min_area_range=(10, 20),
+            ink_swap_max_area_range=(400, 500),
+            p=0.2,
+        ),
+        LinesDegradation(
+            line_roi=(0.0, 0.0, 1.0, 1.0),
+            line_gradient_range=(32, 255),
+            line_gradient_direction=(0, 2),
+            line_split_probability=(0.2, 0.4),
+            line_replacement_value=(250, 255),
+            line_min_length=(30, 40),
+            line_long_to_short_ratio=(5, 7),
+            line_replacement_probability=(0.4, 0.5),
+            line_replacement_thickness=(1, 3),
+            p=0.2,
+        ),
+        OneOf(
+            [
+                Dithering(dither="floyd-steinberg", order=(3, 5)),
+                InkBleed(
+                    intensity_range=(0.1, 0.2),
+                    kernel_size=random.choice([(7, 7), (5, 5), (3, 3)]),
+                    severity=(0.4, 0.6),
+                ),
+            ],
+            p=0.2,
+        ),
+        InkShifter(
+            text_shift_scale_range=(18, 27),
+            text_shift_factor_range=(1, 4),
+            text_fade_range=(0, 2),
+            blur_kernel_size=(5, 5),
+            blur_sigma=0,
+            noise_type="perlin",
+            p=0.2,
+        ),
+    ]
+
+    paper_phase = [
+        NoiseTexturize(
+            sigma_range=(3, 10),
+            turbulence_range=(2, 5),
+            texture_width_range=(300, 500),
+            texture_height_range=(300, 500),
+            p=0.2,
+        ),
+        BrightnessTexturize(texturize_range=(0.9, 0.99), deviation=0.03, p=0.2),
+    ]
+
+    post_phase = [
+        ColorShift(
+            color_shift_offset_x_range=(3, 5),
+            color_shift_offset_y_range=(3, 5),
+            color_shift_iterations=(2, 3),
+            color_shift_brightness_range=(0.9, 1.1),
+            color_shift_gaussian_kernel_range=(3, 3),
+            p=0.2,
+        ),
+        DirtyDrum(
+            line_width_range=(1, 6),
+            line_concentration=random.uniform(0.05, 0.15),
+            direction=random.randint(0, 2),
+            noise_intensity=random.uniform(0.6, 0.95),
+            noise_value=(64, 224),
+            ksize=random.choice([(3, 3), (5, 5), (7, 7)]),
+            sigmaX=0,
+            p=0.2,
+        ),
+        OneOf(
+            [
+                LightingGradient(
+                    light_position=None,
+                    direction=None,
+                    max_brightness=255,
+                    min_brightness=0,
+                    mode="gaussian",
+                    linear_decay_rate=None,
+                    transparency=None,
+                ),
+                Brightness(
+                    brightness_range=(0.9, 1.1),
+                    min_brightness=0,
+                    min_brightness_value=(120, 150),
+                ),
+                Gamma(gamma_range=(0.9, 1.1)),
+            ],
+            p=0.2,
+        ),
+        OneOf(
+            [
+                SubtleNoise(subtle_range=random.randint(5, 10)),
+                Jpeg(quality_range=(70, 95)),
+            ],
+            p=0.2,
+        ),
+    ]
+
+    return AugraphyPipeline(
+        ink_phase=ink_phase,
+        paper_phase=paper_phase,
+        post_phase=post_phase,
+        pre_phase=[],
+        log=False,
+    )
 
 
 def build_transform(

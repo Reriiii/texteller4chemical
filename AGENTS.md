@@ -5,7 +5,7 @@
 - Default base model is `OleehyO/TexTeller`; do not require Tex80M or train from scratch unless the user explicitly changes scope.
 - Current graph-eval target is `ssml_normed`; `ssml_sd` is only a legacy/simple sequence baseline, and `ssml_rcgd` is not suitable for the normal sequence decoder.
 - Keep TexTeller preprocessing at grayscale `448x448x1`; configs set `image_size.height: 448`, `width: 448`, `channels: 1`.
-- Use `configs/train_edu_chemc.yaml` for the active experiment: `max_target_length: 1024`, TexTeller-aligned preprocessing, bf16, LoRA disabled, full-model fine-tuning with encoder unfrozen, length-balanced sampling, 30 epochs.
+- Use `configs/train_edu_chemc.yaml` for the active experiment: `max_target_length: 1024`, TexTeller-aligned preprocessing, TexTeller OCR/Augraphy augmentation, bf16, LoRA disabled, full-model fine-tuning with encoder unfrozen, length-balanced sampling, 30 epochs.
 - `configs/train_edu_chemc_baseline.yaml` is the older 20-epoch decoder-only LoRA r16 baseline for comparison.
 
 ## Data Pipeline
