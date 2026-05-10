@@ -44,6 +44,7 @@ class ImagePreprocessConfig:
     random_border_max: int = 25
     min_augmented_size: int = 30
     augraphy_enabled: bool = False
+    max_augmentation_side: int = 4096
 
 
 def _as_tuple(value: Any, channels: int) -> tuple[float, ...] | None:
@@ -89,6 +90,7 @@ def image_config_from_dict(config: dict[str, Any]) -> ImagePreprocessConfig:
         random_border_max=int(aug.get("random_border_max", 25)),
         min_augmented_size=int(aug.get("min_augmented_size", 30)),
         augraphy_enabled=bool(aug.get("augraphy_enabled", False)),
+        max_augmentation_side=int(aug.get("max_augmentation_side", 4096)),
     )
 
 
@@ -240,6 +242,7 @@ class ResizePadTransform:
         image = self._add_white_border(image, self.cfg.random_border_max)
 
         if self.cfg.augraphy_enabled:
+            image = self._cap_augmentation_size(image)
             image = self._apply_augraphy(image)
 
         # TexTeller applies the normal inference transform after OCR augmentation;
@@ -247,6 +250,27 @@ class ResizePadTransform:
         if self.cfg.trim_white_border:
             image = self._trim_white_border(image)
         return image
+
+    def _cap_augmentation_size(self, image: Image.Image) -> Image.Image:
+        max_side = int(self.cfg.max_augmentation_side)
+        if max_side <= 0:
+            return image
+        current_side = max(image.size)
+        if current_side <= max_side:
+            return image
+        scale = max_side / current_side
+        new_size = (
+            max(1, int(round(image.width * scale))),
+            max(1, int(round(image.height * scale))),
+        )
+        logger.warning(
+            "Downscaling oversized image before Augraphy: %sx%s -> %sx%s",
+            image.width,
+            image.height,
+            new_size[0],
+            new_size[1],
+        )
+        return image.resize(new_size, Image.Resampling.LANCZOS)
 
     def _random_resize(self, image: Image.Image) -> Image.Image:
         min_ratio = self.cfg.random_resize_min

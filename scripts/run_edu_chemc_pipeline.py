@@ -50,6 +50,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--num_machines", type=int, default=1)
     parser.add_argument("--num_processes", type=int, default=None)
+    parser.add_argument(
+        "--cuda_visible_devices",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated physical GPU ids to expose to child processes, "
+            "for example '3' or '0,1'. Prefer this over shell env prefixes "
+            "when using the pipeline script."
+        ),
+    )
     parser.add_argument("--mixed_precision", choices=["no", "fp16", "bf16"], default="bf16")
     parser.add_argument("--dynamo_backend", type=str, default="no")
     parser.add_argument("--eval_split", type=str, default="test")
@@ -81,11 +91,24 @@ def display_cmd(cmd: list[str]) -> str:
     return shlex.join(cmd)
 
 
-def run_command(cmd: list[str], dry_run: bool) -> None:
-    print(f"$ {display_cmd(cmd)}", flush=True)
+def child_env(args: argparse.Namespace) -> dict[str, str]:
+    env = os.environ.copy()
+    if args.cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+    return env
+
+
+def env_prefix(args: argparse.Namespace) -> str:
+    if args.cuda_visible_devices is None:
+        return ""
+    return f"CUDA_VISIBLE_DEVICES={shlex.quote(args.cuda_visible_devices)} "
+
+
+def run_command(cmd: list[str], dry_run: bool, args: argparse.Namespace) -> None:
+    print(f"$ {env_prefix(args)}{display_cmd(cmd)}", flush=True)
     if dry_run:
         return
-    subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
+    subprocess.run(cmd, cwd=PROJECT_ROOT, check=True, env=child_env(args))
 
 
 def load_dataset_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -304,19 +327,31 @@ def evaluate_command(args: argparse.Namespace) -> list[str]:
 def main() -> None:
     args = parse_args()
     stages = selected_stages(args.stages)
+    if (
+        "train" in stages
+        and args.num_processes == 1
+        and args.cuda_visible_devices is None
+        and "CUDA_VISIBLE_DEVICES" not in os.environ
+    ):
+        print(
+            "WARNING: --num_processes 1 only starts one training process, but all GPUs "
+            "remain visible. Transformers Trainer may use torch.nn.DataParallel across "
+            "all visible GPUs. Pass --cuda_visible_devices <gpu_id> to pin one GPU.",
+            flush=True,
+        )
     for stage in stages:
         print(f"\n== {stage} ==", flush=True)
         if stage == "download":
             download_dataset(args)
         elif stage == "prepare":
-            run_command(prepare_command(args), dry_run=args.dry_run)
+            run_command(prepare_command(args), dry_run=args.dry_run, args=args)
         elif stage == "analyze":
             for cmd in analyze_commands(args):
-                run_command(cmd, dry_run=args.dry_run)
+                run_command(cmd, dry_run=args.dry_run, args=args)
         elif stage == "train":
-            run_command(train_command(args), dry_run=args.dry_run)
+            run_command(train_command(args), dry_run=args.dry_run, args=args)
         elif stage == "evaluate":
-            run_command(evaluate_command(args), dry_run=args.dry_run)
+            run_command(evaluate_command(args), dry_run=args.dry_run, args=args)
         else:
             raise AssertionError(f"Unhandled stage: {stage}")
 
