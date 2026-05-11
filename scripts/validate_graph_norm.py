@@ -19,6 +19,7 @@ from chemtexteller.target_normalization import (  # noqa: E402
     SSML_GRAPH_NORM_FIELD,
     SSML_GRAPH_NORM_SOURCE_FIELD,
     normalize_ssml_graph_with_stats,
+    normalize_target_for_field_with_stats,
 )
 from chemtexteller.utils import ensure_dir, read_jsonl, save_json, setup_logging  # noqa: E402
 
@@ -48,9 +49,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep_temp", action="store_true")
     parser.add_argument("--min_graph_em", type=float, default=1.0)
     parser.add_argument("--min_structure_em", type=float, default=1.0)
-    parser.add_argument("--angle_step", type=float, default=1.0)
-    parser.add_argument("--angle_decimals", type=int, default=1)
-    parser.add_argument("--length_decimals", type=int, default=1)
+    parser.add_argument(
+        "--angle_step",
+        type=float,
+        default=1.0,
+        help="Only used when --normalized_key is ssml_graph_norm.",
+    )
+    parser.add_argument(
+        "--angle_decimals",
+        type=int,
+        default=1,
+        help="Only used when --normalized_key is ssml_graph_norm.",
+    )
+    parser.add_argument(
+        "--length_decimals",
+        type=int,
+        default=1,
+        help="Only used when --normalized_key is ssml_graph_norm.",
+    )
     return parser.parse_args()
 
 
@@ -84,6 +100,24 @@ def image_name_for_graph(row: dict[str, Any], idx: int) -> str:
     return Path(str(value)).stem
 
 
+def safe_key_name(value: str) -> str:
+    return value.replace(".", "_").replace("/", "_").replace("\\", "_")
+
+
+def normalize_for_validation(
+    source: str,
+    args: argparse.Namespace,
+) -> tuple[str, Any]:
+    if args.normalized_key == SSML_GRAPH_NORM_FIELD:
+        return normalize_ssml_graph_with_stats(
+            source,
+            angle_step=args.angle_step,
+            angle_decimals=args.angle_decimals,
+            length_decimals=args.length_decimals,
+        )
+    return normalize_target_for_field_with_stats(source, args.normalized_key)
+
+
 def split_rows(args: argparse.Namespace, split: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows = read_jsonl(args.dataset_dir / split / "metadata.jsonl")
     if args.max_samples_per_split is not None:
@@ -100,24 +134,14 @@ def split_rows(args: argparse.Namespace, split: str) -> tuple[list[dict[str, Any
         try:
             normalized = lookup_value(row, args.normalized_key)
         except KeyError:
-            normalized, stats = normalize_ssml_graph_with_stats(
-                source,
-                angle_step=args.angle_step,
-                angle_decimals=args.angle_decimals,
-                length_decimals=args.length_decimals,
-            )
+            normalized, stats = normalize_for_validation(source, args)
             fallback_computed_rows += 1
         else:
-            computed, stats = normalize_ssml_graph_with_stats(
-                source,
-                angle_step=args.angle_step,
-                angle_decimals=args.angle_decimals,
-                length_decimals=args.length_decimals,
-            )
+            computed, stats = normalize_for_validation(source, args)
             if normalized != computed:
                 raise ValueError(
                     f"{split} row {idx} has {args.normalized_key!r} but it does not "
-                    "match the current ssml_graph_norm normalizer."
+                    f"match the current {args.normalized_key} normalizer."
                 )
 
         changed_rows += int(stats.changed)
@@ -146,9 +170,11 @@ def split_rows(args: argparse.Namespace, split: str) -> tuple[list[dict[str, Any
 def validate_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
     graph_rows, stats = split_rows(args, split)
     out_dir = ensure_dir(args.out_dir)
-    rec_path = out_dir / f"{split}.ssml_graph_norm.rec.txt"
-    lab_path = out_dir / f"{split}.ssml_normed.lab.txt"
-    result_path = out_dir / f"{split}.graph_result.txt"
+    normalized_name = safe_key_name(args.normalized_key)
+    source_name = safe_key_name(args.source_key)
+    rec_path = out_dir / f"{split}.{normalized_name}.rec.txt"
+    lab_path = out_dir / f"{split}.{source_name}.lab.txt"
+    result_path = out_dir / f"{split}.{normalized_name}_vs_{source_name}.graph_result.txt"
 
     write_graph_matching_files(graph_rows, rec_path, lab_path)
     result = run_graph_matching_tool(

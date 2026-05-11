@@ -20,6 +20,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from chemtexteller.target_normalization import (
+    SSML_GRAPH_COMPACT_FIELD,
     SSML_GRAPH_NORM_FIELD,
     SSML_GRAPH_NORM_SOURCE_FIELD,
     is_graph_norm_field,
@@ -38,6 +39,7 @@ DEFAULT_TARGET_FIELDS = (
     "ssml_sd",
     "ssml_normed",
     SSML_GRAPH_NORM_FIELD,
+    SSML_GRAPH_COMPACT_FIELD,
     "ssml_rcgd",
 )
 SPLIT_MAP = {
