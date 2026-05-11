@@ -10,13 +10,13 @@ cd "${PROJECT_ROOT}"
 
 STAGES=${STAGES:-all}
 DATASET_ID=${DATASET_ID:-ConstantHao/EDU-CHEMC_MM23}
-DATASET_DIR=${DATASET_DIR:-data/processed/edu_chemc_normed}
+DATASET_DIR=${DATASET_DIR:-data/processed/edu_chemc_graph_norm}
 CACHE_DIR=${CACHE_DIR:-${PROJECT_ROOT}/data/hf_cache/datasets}
-TARGET_FIELD=${TARGET_FIELD:-ssml_normed}
+TARGET_FIELD=${TARGET_FIELD:-ssml_graph_norm}
 CONFIG=${CONFIG:-configs/train_edu_chemc.yaml}
 PRETRAINED_MODEL=${PRETRAINED_MODEL:-OleehyO/TexTeller}
-OUTPUT_DIR=${OUTPUT_DIR:-outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep}
-EVAL_OUTPUT_CSV=${EVAL_OUTPUT_CSV:-outputs/eval_textellerpre_full_model_bf16_30ep_test_greedy.csv}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep}
+EVAL_OUTPUT_CSV=${EVAL_OUTPUT_CSV:-outputs/eval_graph_norm_full_model_bf16_30ep_test_greedy.csv}
 GRAPH_MATCHING_TOOL_DIR=${GRAPH_MATCHING_TOOL_DIR:-external/GraphMatchingTool}
 GRAPH_NUM_WORKERS=${GRAPH_NUM_WORKERS:-8}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}

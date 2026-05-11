@@ -19,13 +19,26 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from chemtexteller.data import IMAGE_EXTENSIONS
+from chemtexteller.target_normalization import (
+    SSML_GRAPH_NORM_FIELD,
+    SSML_GRAPH_NORM_SOURCE_FIELD,
+    is_graph_norm_field,
+    normalize_target_for_field,
+)
 from chemtexteller.tokenizer_utils import whitespace_tokenize
 from chemtexteller.utils import copy_or_symlink, ensure_dir, save_json, setup_logging, write_jsonl
 
 
 logger = setup_logging()
 
-DEFAULT_TARGET_FIELDS = ("ssml_sd", "ssml_normed", "chemfig", "chemfg", "ssml_rcgd")
+DEFAULT_TARGET_FIELDS = (
+    "ssml_sd",
+    "ssml_normed",
+    SSML_GRAPH_NORM_FIELD,
+    "chemfig",
+    "chemfg",
+    "ssml_rcgd",
+)
 
 
 def preview_directory(path: Path, max_items: int = 20) -> list[str]:
@@ -48,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare EDU-CHEMC imagefolder dataset.")
     parser.add_argument("--src_dir", type=Path, required=True)
     parser.add_argument("--out_dir", type=Path, default=Path("data/processed/edu_chemc"))
-    parser.add_argument("--target_field", type=str, default="ssml_normed")
+    parser.add_argument("--target_field", type=str, default=SSML_GRAPH_NORM_FIELD)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
@@ -74,15 +87,20 @@ def parse_args() -> argparse.Namespace:
 
 def normalize_target(raw: Any, target_field: str) -> str:
     if isinstance(raw, str):
-        return raw.strip()
-    if isinstance(raw, list):
+        value = raw.strip()
+    elif isinstance(raw, list):
         if all(isinstance(item, str) for item in raw):
-            return " ".join(item.strip() for item in raw if item.strip()).strip()
-        return json.dumps(raw, ensure_ascii=False)
-    return str(raw).strip()
+            value = " ".join(item.strip() for item in raw if item.strip()).strip()
+        else:
+            value = json.dumps(raw, ensure_ascii=False)
+    else:
+        value = str(raw).strip()
+    return normalize_target_for_field(value, target_field)
 
 
 def resolve_target(annotation: dict[str, Any], target_field: str) -> Any | None:
+    if is_graph_norm_field(target_field):
+        return annotation.get(SSML_GRAPH_NORM_SOURCE_FIELD)
     if target_field in annotation:
         return annotation[target_field]
     if target_field == "chemfig" and "chemfg" in annotation:

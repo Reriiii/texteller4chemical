@@ -20,6 +20,10 @@ data/
 outputs/
 logs/
 
+
+
+augraphy_cache/
+
 # External tools cloned locally
 external/
 

@@ -8,23 +8,23 @@ uv run accelerate launch \
   --dynamo_backend no \
   scripts/train.py \
   --config configs/train_edu_chemc.yaml \
-  --dataset_dir data/processed/edu_chemc_normed \
+  --dataset_dir data/processed/edu_chemc_graph_norm \
   --pretrained_model_name_or_path OleehyO/TexTeller \
-  --output_dir outputs/runs/edu_chemc_texteller_full_model_texteller_ocr_aug_bf16_30ep
+  --output_dir outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep
 
 CUDA_VISIBLE_DEVICES=1 \
 HF_HOME=/home/tuancuong/data5t/chemteller/.hf_cache \
 HF_HUB_CACHE=/home/tuancuong/data5t/chemteller/.hf_cache/hub \
 uv run python scripts/evaluate.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller_full_model_texteller_ocr_aug_bf16_30ep/best \
-  --dataset_dir data/processed/edu_chemc_normed \
+  --model_ckpt outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep/best \
+  --dataset_dir data/processed/edu_chemc_graph_norm \
   --split test \
   --batch_size 8 \
   --num_beams 1 \
   --max_new_tokens 1024 \
   --dtype bf16 \
-  --output_csv outputs/eval_full_model_texteller_ocr_aug_bf16_30ep_test_greedy.csv \
+  --output_csv outputs/eval_graph_norm_full_model_bf16_30ep_test_greedy.csv \
   --graph_eval \
   --graph_matching_tool_dir external/GraphMatchingTool \
-  --graph_label_key ssml_normed \
+  --graph_label_key ssml_graph_norm \
   --graph_num_workers 8

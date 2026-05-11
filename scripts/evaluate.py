@@ -36,6 +36,7 @@ from chemtexteller.inference import (
 )
 from chemtexteller.metrics import per_sample_metrics, sequence_metrics
 from chemtexteller.model_loader import load_pretrained_model_and_tokenizer
+from chemtexteller.target_normalization import SSML_GRAPH_NORM_FIELD
 from chemtexteller.transforms import build_transform
 from chemtexteller.utils import ensure_dir, save_json, setup_logging
 
@@ -117,7 +118,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_csv", type=Path, default=Path("outputs/eval_predictions.csv"))
     parser.add_argument("--graph_eval", action="store_true")
     parser.add_argument("--graph_matching_tool_dir", type=Path, default=None)
-    parser.add_argument("--graph_label_key", type=str, default="ssml_normed")
+    parser.add_argument("--graph_label_key", type=str, default=SSML_GRAPH_NORM_FIELD)
     parser.add_argument("--graph_num_workers", type=int, default=8)
     parser.add_argument("--graph_output_txt", type=Path, default=None)
     parser.add_argument("--graph_keep_temp", action="store_true")
@@ -158,7 +159,7 @@ def validate_dataset_graph_labels(dataset: EduChemcDataset, label_key: str) -> N
                 "Graph evaluation requires metadata label "
                 f"{label_key!r}, but it is missing for sample {idx} "
                 f"({sample.image_name}). Re-run scripts/prepare_edu_chemc.py so "
-                "metadata.jsonl includes targets.ssml_normed, or pass a different "
+                "metadata.jsonl includes the requested graph label, or pass a different "
                 "--graph_label_key."
             ) from exc
 

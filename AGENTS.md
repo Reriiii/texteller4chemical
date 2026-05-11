@@ -3,7 +3,7 @@
 ## Defaults
 - This repo fine-tunes/domain-adapts pretrained TexTeller for EDU-CHEMC / EDU-CHMEC_MM23 handwritten chemical images to chemical markup.
 - Default base model is `OleehyO/TexTeller`; do not require Tex80M or train from scratch unless the user explicitly changes scope.
-- Current graph-eval target is `ssml_normed`; `ssml_sd` is only a legacy/simple sequence baseline, and `ssml_rcgd` is not suitable for the normal sequence decoder.
+- Current graph-eval target is `ssml_graph_norm`, derived from `ssml_normed` by graph-preserving bond geometry rounding; `ssml_sd` is only a legacy/simple sequence baseline, and `ssml_rcgd` is not suitable for the normal sequence decoder.
 - Keep TexTeller preprocessing at grayscale `448x448x1`; configs set `image_size.height: 448`, `width: 448`, `channels: 1`.
 - Use `configs/train_edu_chemc.yaml` for the active experiment: `max_target_length: 1024`, TexTeller-aligned preprocessing, TexTeller OCR/Augraphy augmentation, bf16, LoRA disabled, full-model fine-tuning with encoder unfrozen, length-balanced sampling, 30 epochs.
 - `configs/train_edu_chemc_baseline.yaml` is the older 20-epoch decoder-only LoRA r16 baseline for comparison.
@@ -13,10 +13,11 @@
 - Hugging Face dataset id is `ConstantHao/EDU-CHEMC_MM23`; use `datasets.load_dataset("ConstantHao/EDU-CHEMC_MM23")` when adding/using a download stage.
 - The HF dataset card exposes splits `train`, `val`, `test` and fields `image`, `chemfig`, `ssml_sd`, `ssml_normed`, `ssml_rcgd`, `image_path`; total size is about 53k rows / 28.9 GB.
 - `scripts/run_edu_chemc_pipeline.py` is the end-to-end Linux GPU launcher for download -> materialize -> analyze -> train -> graph-evaluate.
-- `scripts/materialize_hf_edu_chemc.py` uses `load_dataset`, preserves official HF splits, and maps HF `val` to repo split name `validation`.
+- `scripts/materialize_hf_edu_chemc.py` uses `load_dataset`, preserves official HF splits, maps HF `val` to repo split name `validation`, and can materialize repo-generated `ssml_graph_norm` from source field `ssml_normed`.
 - Cache-only HF download command: `uv run python -c "from datasets import load_dataset; load_dataset('ConstantHao/EDU-CHEMC_MM23')"`; this does not create the prepared imagefolder metadata used by training.
 - `scripts/prepare_edu_chemc.py` is only for a local image tree with same-stem `.json` annotations; it creates its own random split, so do not use it when official HF splits matter.
-- Graph eval needs `targets.ssml_normed` in prepared `metadata.jsonl`; re-run prepare with `--target_field ssml_normed` if `evaluate.py --graph_eval` complains about missing graph labels.
+- Graph eval currently uses `targets.ssml_graph_norm` in prepared `metadata.jsonl`; re-run materialize/prepare with `--target_field ssml_graph_norm` if `evaluate.py --graph_eval` complains about missing graph labels.
+- Validate graph-preserving normalization with `scripts/validate_graph_norm.py`; it compares `ssml_graph_norm` predictions against original `ssml_normed` labels through GraphMatchingTool and should report graph/structure EM of 1.0.
 - For local-tree prepare on read-only mounts, `--copy_mode reference` writes absolute source image paths instead of copying images.
 
 ## Setup And Checks
@@ -39,20 +40,32 @@ Materialize current graph target from Hugging Face:
 ```bash
 uv run python scripts/materialize_hf_edu_chemc.py \
   --dataset_id ConstantHao/EDU-CHEMC_MM23 \
-  --out_dir data/processed/edu_chemc_normed \
-  --target_field ssml_normed
+  --out_dir data/processed/edu_chemc_graph_norm \
+  --target_field ssml_graph_norm
 ```
 
 Analyze before serious training:
 
 ```bash
 uv run python scripts/analyze_targets.py \
-  --metadata data/processed/edu_chemc_normed/train/metadata.jsonl
+  --metadata data/processed/edu_chemc_graph_norm/train/metadata.jsonl
 
 uv run python scripts/analyze_tokenizer_coverage.py \
-  --metadata data/processed/edu_chemc_normed/train/metadata.jsonl \
+  --metadata data/processed/edu_chemc_graph_norm/train/metadata.jsonl \
   --pretrained_model_name_or_path OleehyO/TexTeller \
   --max_decoder_length 1024
+```
+
+Validate `ssml_graph_norm` before long training:
+
+```bash
+uv run python scripts/validate_graph_norm.py \
+  --dataset_dir data/processed/edu_chemc_graph_norm \
+  --splits train validation test \
+  --source_key ssml_normed \
+  --normalized_key ssml_graph_norm \
+  --graph_matching_tool_dir external/GraphMatchingTool \
+  --graph_num_workers 8
 ```
 
 Train on a single Linux GPU node:
@@ -64,26 +77,26 @@ uv run accelerate launch \
   --dynamo_backend no \
   scripts/train.py \
   --config configs/train_edu_chemc.yaml \
-  --dataset_dir data/processed/edu_chemc_normed \
+  --dataset_dir data/processed/edu_chemc_graph_norm \
   --pretrained_model_name_or_path OleehyO/TexTeller \
-  --output_dir outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep
+  --output_dir outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep
 ```
 
 Evaluate with paper-style graph matching:
 
 ```bash
 uv run python scripts/evaluate.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep/best \
-  --dataset_dir data/processed/edu_chemc_normed \
+  --model_ckpt outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep/best \
+  --dataset_dir data/processed/edu_chemc_graph_norm \
   --split test \
   --batch_size 8 \
   --num_beams 1 \
   --max_new_tokens 1024 \
   --dtype bf16 \
-  --output_csv outputs/eval_textellerpre_full_model_bf16_30ep_test_greedy.csv \
+  --output_csv outputs/eval_graph_norm_full_model_bf16_30ep_test_greedy.csv \
   --graph_eval \
   --graph_matching_tool_dir external/GraphMatchingTool \
-  --graph_label_key ssml_normed \
+  --graph_label_key ssml_graph_norm \
   --graph_num_workers 8
 ```
 

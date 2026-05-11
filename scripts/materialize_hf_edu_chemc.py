@@ -19,6 +19,12 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from chemtexteller.target_normalization import (
+    SSML_GRAPH_NORM_FIELD,
+    SSML_GRAPH_NORM_SOURCE_FIELD,
+    is_graph_norm_field,
+    normalize_target_for_field,
+)
 from chemtexteller.tokenizer_utils import whitespace_tokenize
 from chemtexteller.utils import ensure_dir, save_json, setup_logging, write_jsonl
 
@@ -26,7 +32,14 @@ from chemtexteller.utils import ensure_dir, save_json, setup_logging, write_json
 logger = setup_logging()
 
 DEFAULT_DATASET_ID = "ConstantHao/EDU-CHEMC_MM23"
-DEFAULT_TARGET_FIELDS = ("chemfig", "chemfg", "ssml_sd", "ssml_normed", "ssml_rcgd")
+DEFAULT_TARGET_FIELDS = (
+    "chemfig",
+    "chemfg",
+    "ssml_sd",
+    "ssml_normed",
+    SSML_GRAPH_NORM_FIELD,
+    "ssml_rcgd",
+)
 SPLIT_MAP = {
     "train": "train",
     "val": "validation",
@@ -45,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--cache_dir", type=Path, default=None)
     parser.add_argument("--out_dir", type=Path, default=Path("data/processed/edu_chemc_normed"))
-    parser.add_argument("--target_field", type=str, default="ssml_normed")
+    parser.add_argument("--target_field", type=str, default=SSML_GRAPH_NORM_FIELD)
     parser.add_argument(
         "--allow_rcgd",
         action="store_true",
@@ -130,16 +143,31 @@ def hf_download_error_message(args: argparse.Namespace, exc: FileNotFoundError) 
     )
 
 
-def normalize_target(raw: Any) -> str:
+def normalize_target(raw: Any, target_field: str | None = None) -> str:
     if raw is None:
         return ""
     if isinstance(raw, str):
-        return raw.strip()
-    if isinstance(raw, list):
+        value = raw.strip()
+    elif isinstance(raw, list):
         if all(isinstance(item, str) for item in raw):
-            return " ".join(item.strip() for item in raw if item.strip()).strip()
-        return json.dumps(raw, ensure_ascii=False)
-    return str(raw).strip()
+            value = " ".join(item.strip() for item in raw if item.strip()).strip()
+        else:
+            value = json.dumps(raw, ensure_ascii=False)
+    else:
+        value = str(raw).strip()
+    if target_field is not None:
+        value = normalize_target_for_field(value, target_field)
+    return value
+
+
+def resolve_raw_target(row: dict[str, Any], target_field: str) -> Any | None:
+    if is_graph_norm_field(target_field):
+        return row.get(SSML_GRAPH_NORM_SOURCE_FIELD)
+    if target_field == "chemfig":
+        return row.get("chemfig", row.get("chemfg"))
+    if target_field == "chemfg":
+        return row.get("chemfg", row.get("chemfig"))
+    return row.get(target_field)
 
 
 def collect_targets(row: dict[str, Any], target_field: str) -> dict[str, str]:
@@ -147,12 +175,8 @@ def collect_targets(row: dict[str, Any], target_field: str) -> dict[str, str]:
     fields.add(target_field)
     targets: dict[str, str] = {}
     for field in sorted(fields):
-        raw = row.get(field)
-        if raw is None and field == "chemfig":
-            raw = row.get("chemfg")
-        if raw is None and field == "chemfg":
-            raw = row.get("chemfig")
-        value = normalize_target(raw)
+        raw = resolve_raw_target(row, field)
+        value = normalize_target(raw, field)
         if value:
             targets[field] = value
     if "chemfg" in targets and "chemfig" not in targets:
@@ -274,11 +298,11 @@ def materialize_split(
         row = split_dataset[idx]
         if not isinstance(row, dict):
             row = dict(row)
-        raw_target = row.get(args.target_field)
+        raw_target = resolve_raw_target(row, args.target_field)
         if raw_target is None:
             skipped_missing_target += 1
             continue
-        target = normalize_target(raw_target)
+        target = normalize_target(raw_target, args.target_field)
         if not target:
             skipped_empty_target += 1
             continue

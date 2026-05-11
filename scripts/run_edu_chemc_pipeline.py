@@ -12,11 +12,12 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_ID = "ConstantHao/EDU-CHEMC_MM23"
-DEFAULT_DATASET_DIR = Path("data/processed/edu_chemc_normed")
+DEFAULT_TARGET_FIELD = "ssml_graph_norm"
+DEFAULT_DATASET_DIR = Path("data/processed/edu_chemc_graph_norm")
 DEFAULT_OUTPUT_DIR = Path(
-    "outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep"
+    "outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep"
 )
-DEFAULT_EVAL_CSV = Path("outputs/eval_textellerpre_full_model_bf16_30ep_test_greedy.csv")
+DEFAULT_EVAL_CSV = Path("outputs/eval_graph_norm_full_model_bf16_30ep_test_greedy.csv")
 STAGE_ORDER = ("download", "prepare", "analyze", "train", "evaluate")
 STAGE_ALIASES = ("all", "train_eval")
 
@@ -40,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--cache_dir", type=Path, default=None)
     parser.add_argument("--dataset_dir", type=Path, default=DEFAULT_DATASET_DIR)
-    parser.add_argument("--target_field", type=str, default="ssml_normed")
+    parser.add_argument("--target_field", type=str, default=DEFAULT_TARGET_FIELD)
     parser.add_argument("--max_samples_per_split", type=int, default=None)
     parser.add_argument("--overwrite_prepare", action="store_true")
     parser.add_argument("--config", type=Path, default=Path("configs/train_edu_chemc.yaml"))

@@ -9,7 +9,7 @@ handwritten chemical image -> pretrained TexTeller -> chemical markup sequence
 ## Scope
 
 - Default model: `OleehyO/TexTeller`.
-- Current graph-eval target: `ssml_normed`.
+- Current graph-eval target: `ssml_graph_norm`, generated from `ssml_normed` by graph-preserving bond geometry rounding.
 - Legacy/simple sequence target: `ssml_sd`.
 - Image format: grayscale `448x448x1`.
 - The project does not require Tex80M and does not train TexTeller from scratch by default.
@@ -55,8 +55,8 @@ Preferred Hugging Face path, preserving official `train`/`val`/`test` splits and
 ```bash
 uv run python scripts/materialize_hf_edu_chemc.py \
   --dataset_id ConstantHao/EDU-CHEMC_MM23 \
-  --out_dir data/processed/edu_chemc_normed \
-  --target_field ssml_normed
+  --out_dir data/processed/edu_chemc_graph_norm \
+  --target_field ssml_graph_norm
 ```
 
 Legacy local image + same-stem JSON tree path:
@@ -64,8 +64,8 @@ Legacy local image + same-stem JSON tree path:
 ```bash
 uv run python scripts/prepare_edu_chemc.py \
   --src_dir /path/to/EDU-CHMEC_MM23 \
-  --out_dir data/processed/edu_chemc_normed \
-  --target_field ssml_normed
+  --out_dir data/processed/edu_chemc_graph_norm \
+  --target_field ssml_graph_norm
 ```
 
 For read-only local-tree dataset mounts, add:
@@ -78,12 +78,24 @@ For read-only local-tree dataset mounts, add:
 
 ```bash
 uv run python scripts/analyze_targets.py \
-  --metadata data/processed/edu_chemc_normed/train/metadata.jsonl
+  --metadata data/processed/edu_chemc_graph_norm/train/metadata.jsonl
 
 uv run python scripts/analyze_tokenizer_coverage.py \
-  --metadata data/processed/edu_chemc_normed/train/metadata.jsonl \
+  --metadata data/processed/edu_chemc_graph_norm/train/metadata.jsonl \
   --pretrained_model_name_or_path OleehyO/TexTeller \
   --max_decoder_length 1024
+```
+
+Validate that `ssml_graph_norm` still preserves the original `ssml_normed` graph semantics before a serious run:
+
+```bash
+uv run python scripts/validate_graph_norm.py \
+  --dataset_dir data/processed/edu_chemc_graph_norm \
+  --splits train validation test \
+  --source_key ssml_normed \
+  --normalized_key ssml_graph_norm \
+  --graph_matching_tool_dir external/GraphMatchingTool \
+  --graph_num_workers 8
 ```
 
 ## Train
@@ -95,9 +107,9 @@ uv run accelerate launch \
   --dynamo_backend no \
   scripts/train.py \
   --config configs/train_edu_chemc.yaml \
-  --dataset_dir data/processed/edu_chemc_normed \
+  --dataset_dir data/processed/edu_chemc_graph_norm \
   --pretrained_model_name_or_path OleehyO/TexTeller \
-  --output_dir outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep
+  --output_dir outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep
 ```
 
 To reproduce the previous baseline, swap the config and output directory:
@@ -111,17 +123,17 @@ To reproduce the previous baseline, swap the config and output directory:
 
 ```bash
 uv run python scripts/evaluate.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep/best \
-  --dataset_dir data/processed/edu_chemc_normed \
+  --model_ckpt outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep/best \
+  --dataset_dir data/processed/edu_chemc_graph_norm \
   --split test \
   --batch_size 8 \
   --num_beams 1 \
   --max_new_tokens 1024 \
   --dtype bf16 \
-  --output_csv outputs/eval_textellerpre_full_model_bf16_30ep_test_greedy.csv \
+  --output_csv outputs/eval_graph_norm_full_model_bf16_30ep_test_greedy.csv \
   --graph_eval \
   --graph_matching_tool_dir external/GraphMatchingTool \
-  --graph_label_key ssml_normed \
+  --graph_label_key ssml_graph_norm \
   --graph_num_workers 8
 ```
 
@@ -131,7 +143,7 @@ Built-in metrics include exact match, normalized exact match, token edit distanc
 
 ```bash
 uv run python scripts/predict.py \
-  --model_ckpt outputs/runs/edu_chemc_texteller_textellerpre_full_model_bf16_30ep/best \
+  --model_ckpt outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep/best \
   --image_path /path/to/image.png \
   --max_new_tokens 1024
 ```
