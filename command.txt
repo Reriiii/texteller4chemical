@@ -1,3 +1,9 @@
+uv run python scripts/materialize_hf_edu_chemc.py \
+  --dataset_id ConstantHao/EDU-CHEMC_MM23 \
+  --out_dir data/processed/edu_chemc_graph_norm \
+  --target_field ssml_graph_norm
+
+
 CUDA_VISIBLE_DEVICES=1 \
 HF_HOME=/home/tuancuong/data5t/chemteller/.hf_cache \
 HF_HUB_CACHE=/home/tuancuong/data5t/chemteller/.hf_cache/hub \
