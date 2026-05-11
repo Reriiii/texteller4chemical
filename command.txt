@@ -34,3 +34,17 @@ uv run python scripts/evaluate.py \
   --graph_matching_tool_dir external/GraphMatchingTool \
   --graph_label_key ssml_graph_norm \
   --graph_num_workers 8
+
+uv run python scripts/run_edu_chemc_pipeline.py \
+  --stages train_eval \
+  --config configs/train_edu_chemc_sota_graph_safe.yaml \
+  --dataset_dir data/processed/edu_chemc_normed \
+  --target_field ssml_sd \
+  --eval_target_key targets.ssml_sd \
+  --graph_label_key ssml_graph_norm \
+  --prediction_normalizer ssml_graph_sd \
+  --cuda_visible_devices 1 \
+  --num_processes 1 \
+  --output_dir outputs/runs/edu_chemc_sota_graph_safe \
+  --eval_output_csv outputs/eval_sota_graph_safe_test_greedy.csv \
+  --graph_matching_tool_dir external/GraphMatchingTool

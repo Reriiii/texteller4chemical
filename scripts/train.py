@@ -564,6 +564,22 @@ def target_length_policy(config: dict[str, Any]) -> str:
     return str(config.get("target_length_policy", "error"))
 
 
+def data_target_key(config: dict[str, Any], split: str) -> str:
+    data_cfg = config.get("data", {})
+    if not isinstance(data_cfg, dict):
+        return "target"
+    if split == "train":
+        return str(data_cfg.get("train_target_key", data_cfg.get("target_key", "target")))
+    if split in {"validation", "eval"}:
+        return str(
+            data_cfg.get(
+                "eval_target_key",
+                data_cfg.get("validation_target_key", data_cfg.get("target_key", "target")),
+            )
+        )
+    return str(data_cfg.get("target_key", "target"))
+
+
 def configure_progress_callback(trainer: Seq2SeqTrainer, training_cfg: dict[str, Any]) -> None:
     if not bool(training_cfg.get("stable_tqdm", True)):
         return
@@ -746,6 +762,8 @@ def main() -> None:
 
     max_target_length = int(config.get("max_target_length", 512))
     length_policy = target_length_policy(config)
+    train_target_key = data_target_key(config, "train")
+    eval_target_key = data_target_key(config, "validation")
     train_transform = build_transform(config, train=True, processor=bundle.processor)
     eval_transform = build_transform(config, train=False, processor=bundle.processor)
     train_dataset = EduChemcDataset(
@@ -753,6 +771,7 @@ def main() -> None:
         tokenizer=bundle.tokenizer,
         transform=train_transform,
         max_target_length=max_target_length,
+        target_key=train_target_key,
         target_length_policy=length_policy,
     )
     eval_dataset = EduChemcDataset(
@@ -760,6 +779,7 @@ def main() -> None:
         tokenizer=bundle.tokenizer,
         transform=eval_transform,
         max_target_length=max_target_length,
+        target_key=eval_target_key,
         target_length_policy=length_policy,
     )
     collator = VisionSeq2SeqCollator(bundle.tokenizer)
@@ -780,9 +800,11 @@ def main() -> None:
     trainer.add_callback(TrainingFileLogCallback(event_log_file))
 
     logger.info(
-        "Starting fine-tuning with %s train and %s validation samples.",
+        "Starting fine-tuning with %s train and %s validation samples | train_target_key=%s eval_target_key=%s.",
         len(train_dataset),
         len(eval_dataset),
+        train_target_key,
+        eval_target_key,
     )
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     if bool(training_cfg.get("save_last_model", False)):

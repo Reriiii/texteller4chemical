@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 
 SSML_GRAPH_NORM_FIELD = "ssml_graph_norm"
+SSML_GRAPH_SD_FIELD = "ssml_graph_sd"
 SSML_GRAPH_COMPACT_FIELD = "ssml_graph_compact"
 SSML_GRAPH_NORM_SOURCE_FIELD = "ssml_normed"
 
@@ -27,7 +28,11 @@ class GraphNormalizationStats:
 
 
 def is_graph_norm_field(target_field: str) -> bool:
-    return target_field in {SSML_GRAPH_NORM_FIELD, SSML_GRAPH_COMPACT_FIELD}
+    return target_field in {
+        SSML_GRAPH_NORM_FIELD,
+        SSML_GRAPH_SD_FIELD,
+        SSML_GRAPH_COMPACT_FIELD,
+    }
 
 
 def normalize_ssml_graph(
@@ -37,6 +42,7 @@ def normalize_ssml_graph(
     angle_decimals: int = 1,
     length_decimals: int = 1,
     drop_default_length: bool = False,
+    drop_all_lengths: bool = False,
     default_length: float = 1.0,
     length_default_tolerance: float = 0.05,
 ) -> str:
@@ -52,6 +58,7 @@ def normalize_ssml_graph(
         angle_decimals=angle_decimals,
         length_decimals=length_decimals,
         drop_default_length=drop_default_length,
+        drop_all_lengths=drop_all_lengths,
         default_length=default_length,
         length_default_tolerance=length_default_tolerance,
     )[0]
@@ -64,6 +71,7 @@ def normalize_ssml_graph_with_stats(
     angle_decimals: int = 1,
     length_decimals: int = 1,
     drop_default_length: bool = False,
+    drop_all_lengths: bool = False,
     default_length: float = 1.0,
     length_default_tolerance: float = 0.05,
 ) -> tuple[str, GraphNormalizationStats]:
@@ -93,8 +101,11 @@ def normalize_ssml_graph_with_stats(
         angle_text = f"{rounded_angle:.{angle_decimals}f}"
         length_text = f"{rounded_length:.{length_decimals}f}"
         should_drop_length = (
-            drop_default_length
-            and abs(length - default_length) <= length_default_tolerance + 1e-9
+            drop_all_lengths
+            or (
+                drop_default_length
+                and abs(length - default_length) <= length_default_tolerance + 1e-9
+            )
         )
         if should_drop_length:
             lengths_dropped += 1
@@ -135,6 +146,17 @@ def normalize_ssml_graph_compact(text: str) -> str:
     )
 
 
+def normalize_ssml_graph_sd(text: str) -> str:
+    """CROCS SSSL-SD style target: 15-degree bonds and omitted lengths."""
+    return normalize_ssml_graph(
+        text,
+        angle_step=15.0,
+        angle_decimals=0,
+        length_decimals=1,
+        drop_all_lengths=True,
+    )
+
+
 def normalize_ssml_graph_compact_with_stats(
     text: str,
 ) -> tuple[str, GraphNormalizationStats]:
@@ -149,12 +171,26 @@ def normalize_ssml_graph_compact_with_stats(
     )
 
 
+def normalize_ssml_graph_sd_with_stats(
+    text: str,
+) -> tuple[str, GraphNormalizationStats]:
+    return normalize_ssml_graph_with_stats(
+        text,
+        angle_step=15.0,
+        angle_decimals=0,
+        length_decimals=1,
+        drop_all_lengths=True,
+    )
+
+
 def normalize_target_for_field_with_stats(
     value: str,
     target_field: str,
 ) -> tuple[str, GraphNormalizationStats]:
     if target_field == SSML_GRAPH_NORM_FIELD:
         return normalize_ssml_graph_with_stats(value)
+    if target_field == SSML_GRAPH_SD_FIELD:
+        return normalize_ssml_graph_sd_with_stats(value)
     if target_field == SSML_GRAPH_COMPACT_FIELD:
         return normalize_ssml_graph_compact_with_stats(value)
     return value, GraphNormalizationStats(
@@ -167,6 +203,8 @@ def normalize_target_for_field_with_stats(
 def normalize_target_for_field(value: str, target_field: str) -> str:
     if target_field == SSML_GRAPH_NORM_FIELD:
         return normalize_ssml_graph(value)
+    if target_field == SSML_GRAPH_SD_FIELD:
+        return normalize_ssml_graph_sd(value)
     if target_field == SSML_GRAPH_COMPACT_FIELD:
         return normalize_ssml_graph_compact(value)
     return value

@@ -147,10 +147,11 @@ def run_graph_matching_tool(
         "-output",
         str(output_path),
         "-num_workers",
-        str(num_workers),
+        str(max(1, int(num_workers))),
     ]
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
     completed = subprocess.run(
         cmd,
         cwd=str(tool_dir),

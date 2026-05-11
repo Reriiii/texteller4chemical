@@ -36,7 +36,7 @@ from chemtexteller.inference import (
 )
 from chemtexteller.metrics import per_sample_metrics, sequence_metrics
 from chemtexteller.model_loader import load_pretrained_model_and_tokenizer
-from chemtexteller.target_normalization import SSML_GRAPH_NORM_FIELD
+from chemtexteller.target_normalization import SSML_GRAPH_NORM_FIELD, normalize_target_for_field
 from chemtexteller.transforms import build_transform
 from chemtexteller.utils import ensure_dir, save_json, setup_logging
 
@@ -50,6 +50,7 @@ TEMP_FIELDNAMES = [
     "image_path",
     "ground_truth",
     "graph_label",
+    "raw_prediction",
     "prediction",
     "exact_match",
     "normalized_exact_match",
@@ -119,6 +120,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph_eval", action="store_true")
     parser.add_argument("--graph_matching_tool_dir", type=Path, default=None)
     parser.add_argument("--graph_label_key", type=str, default=SSML_GRAPH_NORM_FIELD)
+    parser.add_argument(
+        "--prediction_normalizer",
+        type=str,
+        default=None,
+        help=(
+            "Optional target-normalization field applied to decoded predictions before "
+            "sequence metrics and graph evaluation, e.g. ssml_graph_sd or ssml_graph_norm."
+        ),
+    )
     parser.add_argument("--graph_num_workers", type=int, default=8)
     parser.add_argument("--graph_output_txt", type=Path, default=None)
     parser.add_argument("--graph_keep_temp", action="store_true")
@@ -162,6 +172,12 @@ def validate_dataset_graph_labels(dataset: EduChemcDataset, label_key: str) -> N
                 "metadata.jsonl includes the requested graph label, or pass a different "
                 "--graph_label_key."
             ) from exc
+
+
+def normalize_prediction(prediction: str, normalizer: str | None) -> str:
+    if normalizer is None or normalizer.lower() in {"", "none", "off", "false"}:
+        return prediction
+    return normalize_target_for_field(prediction, normalizer)
 
 
 def write_rows(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
@@ -282,10 +298,11 @@ def main() -> None:
                 batch["targets"],
                 decoded,
             ):
+                normalized_pred = normalize_prediction(pred, args.prediction_normalizer)
                 graph_label = ""
                 if args.graph_eval:
                     graph_label = lookup_target(metadata_targets, args.graph_label_key)
-                sample_metrics = per_sample_metrics(pred, ref)
+                sample_metrics = per_sample_metrics(normalized_pred, ref)
                 rows.append(
                     {
                         "sample_index": sample_index,
@@ -293,7 +310,8 @@ def main() -> None:
                         "image_path": image_path,
                         "ground_truth": ref,
                         "graph_label": graph_label,
-                        "prediction": pred,
+                        "raw_prediction": pred,
+                        "prediction": normalized_pred,
                         **sample_metrics,
                     }
                 )
@@ -313,6 +331,8 @@ def main() -> None:
     predictions = [str(row["prediction"]) for row in rows]
     references = [str(row["ground_truth"]) for row in rows]
     metrics = sequence_metrics(predictions, references)
+    if args.prediction_normalizer:
+        metrics["prediction_normalizer"] = args.prediction_normalizer
     if args.graph_eval:
         rec_path, lab_path, result_path = graph_output_paths(
             args.output_csv,

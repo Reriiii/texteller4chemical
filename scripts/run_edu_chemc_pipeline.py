@@ -67,10 +67,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_output_csv", type=Path, default=DEFAULT_EVAL_CSV)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--eval_max_samples", type=int, default=None)
+    parser.add_argument(
+        "--eval_target_key",
+        type=str,
+        default=None,
+        help="Target key used as the sequence reference in evaluate.py; defaults to prepared target.",
+    )
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--dtype", choices=["auto", "fp32", "fp16", "bf16"], default="bf16")
     parser.add_argument("--graph_matching_tool_dir", type=Path, default=Path("external/GraphMatchingTool"))
+    parser.add_argument(
+        "--graph_label_key",
+        type=str,
+        default=None,
+        help="Metadata target used as the GraphMatchingTool label; defaults to --target_field.",
+    )
+    parser.add_argument(
+        "--prediction_normalizer",
+        type=str,
+        default=None,
+        help="Optional prediction normalizer for graph-safe evaluation, e.g. ssml_graph_sd.",
+    )
     parser.add_argument("--graph_num_workers", type=int, default=8)
     parser.add_argument("--no_graph_eval", action="store_true")
     parser.add_argument("--graph_keep_temp", action="store_true")
@@ -302,8 +320,12 @@ def evaluate_command(args: argparse.Namespace) -> list[str]:
         "--output_csv",
         str(args.eval_output_csv),
         "--graph_label_key",
-        args.target_field,
+        args.graph_label_key or args.target_field,
     ]
+    if args.eval_target_key:
+        cmd.extend(["--target_key", args.eval_target_key])
+    if args.prediction_normalizer:
+        cmd.extend(["--prediction_normalizer", args.prediction_normalizer])
     if args.eval_max_samples is not None:
         cmd.extend(["--max_samples", str(args.eval_max_samples)])
     if args.tokenizer_path:

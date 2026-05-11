@@ -43,7 +43,8 @@ def _metadata_targets(row: dict[str, Any], target_key: str, target: str) -> dict
     target_field = row.get("target_field")
     if isinstance(target_field, str) and target_field:
         targets.setdefault(target_field, target)
-    targets.setdefault(target_key, target)
+    nested_target_key = target_key.split(".", 1)[1] if target_key.startswith("targets.") else target_key
+    targets.setdefault(nested_target_key, target)
     return targets
 
 
