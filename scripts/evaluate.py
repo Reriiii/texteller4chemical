@@ -91,7 +91,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--config", type=Path, default=None)
-    parser.add_argument("--target_key", type=str, default="target")
+    parser.add_argument(
+        "--target_key",
+        type=str,
+        default=None,
+        help=(
+            "Metadata target key used for sequence metrics. Defaults to data.eval_target_key, "
+            "data.validation_target_key, or data.target_key from the train config."
+        ),
+    )
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -174,6 +182,20 @@ def validate_dataset_graph_labels(dataset: EduChemcDataset, label_key: str) -> N
             ) from exc
 
 
+def resolve_eval_target_key(config: dict[str, Any], target_key: str | None) -> str:
+    if target_key:
+        return target_key
+    data_cfg = config.get("data", {})
+    if isinstance(data_cfg, dict):
+        return str(
+            data_cfg.get(
+                "eval_target_key",
+                data_cfg.get("validation_target_key", data_cfg.get("target_key", "target")),
+            )
+        )
+    return "target"
+
+
 def normalize_prediction(prediction: str, normalizer: str | None) -> str:
     if normalizer is None or normalizer.lower() in {"", "none", "off", "false"}:
         return prediction
@@ -211,6 +233,7 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     config = load_inference_config(args.model_ckpt, args.config, args.max_new_tokens)
+    target_key = resolve_eval_target_key(config, args.target_key)
     bundle = load_pretrained_model_and_tokenizer(
         model_name_or_path=str(args.model_ckpt),
         tokenizer_path=args.tokenizer_path,
@@ -233,9 +256,10 @@ def main() -> None:
         tokenizer=bundle.tokenizer,
         transform=transform,
         max_target_length=int(config.get("max_target_length", args.max_new_tokens)),
-        target_key=args.target_key,
+        target_key=target_key,
         tokenize_targets=False,
     )
+    logger.info("Evaluating %s split with target_key=%s.", args.split, target_key)
     if args.graph_eval:
         validate_dataset_graph_labels(dataset, args.graph_label_key)
     sample_indices = list(range(len(dataset)))

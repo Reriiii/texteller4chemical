@@ -34,6 +34,9 @@ def load_inference_config(
     candidate = model_ckpt / "train_config.yaml"
     if candidate.exists():
         return load_yaml(candidate)
+    parent_candidate = model_ckpt.parent / "train_config.yaml"
+    if parent_candidate.exists():
+        return load_yaml(parent_candidate)
     config = deepcopy(DEFAULT_INFERENCE_CONFIG)
     config["max_target_length"] = max_new_tokens
     return config
@@ -118,13 +121,11 @@ def generation_kwargs(
         if value is not None:
             kwargs[name] = value
 
-    decoder_start = _tokenizer_token_id(tokenizer, "bos_token_id")
+    decoder_start = _configured_token_id(model, "decoder_start_token_id")
+    if decoder_start is None:
+        decoder_start = _tokenizer_token_id(tokenizer, "bos_token_id")
     if decoder_start is None:
         decoder_start = _tokenizer_token_id(tokenizer, "cls_token_id")
-    if decoder_start is None:
-        decoder_start = _tokenizer_token_id(tokenizer, "eos_token_id")
-    if decoder_start is None:
-        decoder_start = _configured_token_id(model, "decoder_start_token_id")
     if decoder_start is not None:
         kwargs["decoder_start_token_id"] = decoder_start
     return kwargs

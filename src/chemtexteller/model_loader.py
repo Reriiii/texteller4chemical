@@ -306,12 +306,6 @@ def _configure_special_token_ids(
     config = getattr(model, "config", None)
     generation_config = getattr(model, "generation_config", None)
 
-    decoder_start = None
-    for name in ("bos_token_id", "cls_token_id", "eos_token_id"):
-        decoder_start = getattr(tokenizer, name, None)
-        if decoder_start is not None:
-            break
-
     def align_config_ids(config_obj) -> None:
         if config_obj is None:
             return
@@ -319,8 +313,12 @@ def _configure_special_token_ids(
             value = getattr(tokenizer, name, None)
             if value is not None:
                 setattr(config_obj, name, value)
-        if decoder_start is not None:
-            setattr(config_obj, "decoder_start_token_id", decoder_start)
+        if getattr(config_obj, "decoder_start_token_id", None) is None:
+            for name in ("bos_token_id", "cls_token_id", "eos_token_id"):
+                value = getattr(tokenizer, name, None)
+                if value is not None:
+                    setattr(config_obj, "decoder_start_token_id", value)
+                    break
 
     align_config_ids(config)
     align_config_ids(generation_config)
