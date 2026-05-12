@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import contextlib
+import random
 from pathlib import Path
 
 import torch
@@ -219,6 +220,15 @@ def parse_args() -> argparse.Namespace:
         help="Evaluate only the first N samples from the selected split.",
     )
     parser.add_argument(
+        "--sample_seed",
+        type=int,
+        default=None,
+        help=(
+            "Shuffle the selected split with this seed before applying --max_samples. "
+            "Use this for representative quick evaluation subsets."
+        ),
+    )
+    parser.add_argument(
         "--dtype",
         choices=["auto", "fp32", "fp16", "bf16"],
         default="auto",
@@ -405,6 +415,9 @@ def main() -> None:
     if args.graph_eval:
         validate_dataset_graph_labels(dataset, args.graph_label_key)
     sample_indices = list(range(len(dataset)))
+    if args.sample_seed is not None:
+        rng = random.Random(args.sample_seed)
+        rng.shuffle(sample_indices)
     if args.max_samples is not None:
         sample_indices = sample_indices[: args.max_samples]
     process_indices = sample_indices[accelerator.process_index :: accelerator.num_processes]
