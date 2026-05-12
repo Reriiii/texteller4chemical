@@ -18,6 +18,10 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from chemtexteller.data import EduChemcDataset, VisionSeq2SeqCollator
+from chemtexteller.component_decode import (
+    TwoPassDecodeConfig,
+    decode_components_for_image,
+)
 from chemtexteller.graph_matching_eval import (
     lookup_target,
     run_graph_matching_tool,
@@ -51,7 +55,13 @@ TEMP_FIELDNAMES = [
     "ground_truth",
     "graph_label",
     "raw_prediction",
+    "first_pass_prediction",
     "prediction",
+    "two_pass_used",
+    "two_pass_reason",
+    "two_pass_crops",
+    "two_pass_stitched_prediction",
+    "component_predictions",
     "exact_match",
     "normalized_exact_match",
     "token_edit_distance",
@@ -131,6 +141,56 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Optional generation repetition_penalty override.",
+    )
+    parser.add_argument(
+        "--two_pass_decode",
+        action="store_true",
+        help=(
+            "Enable experimental component-level second-pass decoding for wide/long "
+            "reaction images. The first pass is still saved for comparison."
+        ),
+    )
+    parser.add_argument(
+        "--two_pass_min_aspect_ratio",
+        type=float,
+        default=2.4,
+        help="Trigger second-pass crops when trimmed image width/height is at least this value.",
+    )
+    parser.add_argument(
+        "--two_pass_window_aspect_ratio",
+        type=float,
+        default=2.2,
+        help="Approximate width/height ratio for each horizontal component crop.",
+    )
+    parser.add_argument(
+        "--two_pass_overlap_ratio",
+        type=float,
+        default=0.20,
+        help="Fractional overlap between adjacent horizontal crops.",
+    )
+    parser.add_argument(
+        "--two_pass_max_crops",
+        type=int,
+        default=5,
+        help="Maximum number of horizontal crops in the second pass.",
+    )
+    parser.add_argument(
+        "--two_pass_crop_max_new_tokens",
+        type=int,
+        default=512,
+        help="Maximum generation length per component crop; set <=0 to reuse max_new_tokens.",
+    )
+    parser.add_argument(
+        "--two_pass_selection",
+        choices=["syntax_or_longer", "syntax", "always", "never"],
+        default="syntax_or_longer",
+        help="How to choose whether stitched component output replaces the first pass.",
+    )
+    parser.add_argument(
+        "--two_pass_min_length_gain_tokens",
+        type=int,
+        default=20,
+        help="Minimum stitched-token length gain used by syntax_or_longer selection.",
     )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
@@ -251,6 +311,24 @@ def log_inference_preprocessing(config: dict[str, object]) -> None:
     )
 
 
+def two_pass_config_from_args(args: argparse.Namespace) -> TwoPassDecodeConfig:
+    crop_max_new_tokens = (
+        None
+        if args.two_pass_crop_max_new_tokens is None
+        or args.two_pass_crop_max_new_tokens <= 0
+        else int(args.two_pass_crop_max_new_tokens)
+    )
+    return TwoPassDecodeConfig(
+        min_aspect_ratio=float(args.two_pass_min_aspect_ratio),
+        window_aspect_ratio=float(args.two_pass_window_aspect_ratio),
+        overlap_ratio=float(args.two_pass_overlap_ratio),
+        max_crops=int(args.two_pass_max_crops),
+        crop_max_new_tokens=crop_max_new_tokens,
+        selection=str(args.two_pass_selection),
+        min_length_gain_tokens=int(args.two_pass_min_length_gain_tokens),
+    )
+
+
 def write_rows(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -360,6 +438,9 @@ def main() -> None:
         "Generation kwargs | %s",
         ", ".join(f"{key}={value!r}" for key, value in sorted(gen_kwargs.items())),
     )
+    two_pass_cfg = two_pass_config_from_args(args) if args.two_pass_decode else None
+    if two_pass_cfg is not None:
+        logger.info("Two-pass component decoding enabled | %s", two_pass_cfg)
     autocast_ctx = autocast_context(device, inference_dtype)
     with torch.inference_mode(), autocast_ctx:
         progress = tqdm(
@@ -381,6 +462,35 @@ def main() -> None:
                 batch["targets"],
                 decoded,
             ):
+                first_pass_prediction = pred
+                component_predictions = ""
+                two_pass_used = False
+                two_pass_reason = ""
+                two_pass_crops = 0
+                two_pass_stitched_prediction = ""
+                if two_pass_cfg is not None:
+                    two_pass = decode_components_for_image(
+                        image_path=image_path,
+                        first_pass_prediction=first_pass_prediction,
+                        model=bundle.model,
+                        tokenizer=bundle.tokenizer,
+                        transform=transform,
+                        gen_kwargs=gen_kwargs,
+                        device=device,
+                        dtype=inference_dtype,
+                        cfg=two_pass_cfg,
+                    )
+                    pred = two_pass.prediction
+                    two_pass_used = two_pass.used
+                    two_pass_reason = ";".join(two_pass.reasons)
+                    two_pass_crops = two_pass.crop_count
+                    two_pass_stitched_prediction = " ".join(
+                        two_pass.stitched_prediction.split()
+                    )
+                    component_predictions = " <COMPONENT> ".join(
+                        " ".join(text.split())
+                        for text in two_pass.component_predictions
+                    )
                 normalized_pred = normalize_prediction(pred, args.prediction_normalizer)
                 graph_label = ""
                 if args.graph_eval:
@@ -394,7 +504,13 @@ def main() -> None:
                         "ground_truth": ref,
                         "graph_label": graph_label,
                         "raw_prediction": pred,
+                        "first_pass_prediction": first_pass_prediction,
                         "prediction": normalized_pred,
+                        "two_pass_used": two_pass_used,
+                        "two_pass_reason": two_pass_reason,
+                        "two_pass_crops": two_pass_crops,
+                        "two_pass_stitched_prediction": two_pass_stitched_prediction,
+                        "component_predictions": component_predictions,
                         **sample_metrics,
                     }
                 )
@@ -414,6 +530,10 @@ def main() -> None:
     predictions = [str(row["prediction"]) for row in rows]
     references = [str(row["ground_truth"]) for row in rows]
     metrics = sequence_metrics(predictions, references)
+    if two_pass_cfg is not None and rows:
+        two_pass_used = sum(str(row["two_pass_used"]).lower() == "true" for row in rows)
+        metrics["two_pass_used"] = two_pass_used
+        metrics["two_pass_used_rate"] = two_pass_used / len(rows)
     if args.prediction_normalizer:
         metrics["prediction_normalizer"] = args.prediction_normalizer
     if args.graph_eval:
