@@ -102,9 +102,8 @@ def parse_graph_matching_stdout(stdout: str) -> dict[str, Any]:
 
     metrics: dict[str, Any] = {}
     metric_mapping = {
-        "base": "graph_base_sent_acc",
-        "struct": "graph_structure_em",
         "struct.line": "graph_em",
+        "struct": "graph_structure_em",
     }
     for source_name, output_name in metric_mapping.items():
         if source_name not in parsed:

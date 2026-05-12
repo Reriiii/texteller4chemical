@@ -379,7 +379,7 @@ def main() -> None:
             }
         )
         logger.info(
-            "Graph matching metrics: EM(struct.line)=%.6f, Structure EM(struct)=%.6f",
+            "Graph matching metrics: EM=%.6f, Structure EM=%.6f",
             metrics["graph_em"],
             metrics["graph_structure_em"],
         )

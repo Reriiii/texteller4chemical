@@ -5,7 +5,7 @@
 - Default base model is `OleehyO/TexTeller`; do not require Tex80M or train from scratch unless the user explicitly changes scope.
 - Current graph-eval target is `ssml_graph_norm`, derived from `ssml_normed` by graph-preserving bond geometry rounding; `ssml_sd` is only a legacy/simple sequence baseline, and `ssml_rcgd` is not suitable for the normal sequence decoder.
 - Keep TexTeller preprocessing at grayscale `448x448x1`; configs set `image_size.height: 448`, `width: 448`, `channels: 1`.
-- Use `configs/train_edu_chemc.yaml` for the active experiment: `max_target_length: 1024`, TexTeller-aligned preprocessing, TexTeller OCR/Augraphy augmentation, bf16, LoRA disabled, full-model fine-tuning with encoder unfrozen, length-balanced sampling, 30 epochs.
+- Use `configs/train_edu_chemc.yaml` for the active experiment: `max_target_length: 1024`, TexTeller-aligned preprocessing, SSML-safe RFL/CHEMC-style augmentation, bf16, LoRA disabled, full-model fine-tuning with encoder unfrozen, length-balanced sampling, 30 epochs.
 - `configs/train_edu_chemc_baseline.yaml` is the older 20-epoch decoder-only LoRA r16 baseline for comparison.
 
 ## Data Pipeline
@@ -103,7 +103,7 @@ uv run python scripts/evaluate.py \
 ## GraphMatchingTool
 - `scripts/evaluate.py --graph_eval` requires `external/GraphMatchingTool/eval.py`; `external/` is gitignored, so clone/install it locally on the server.
 - GraphMatchingTool is invoked with the same Python executable running `evaluate.py`; install its dependencies in that environment, for example `python-Levenshtein` if the tool needs it.
-- Metric mapping in `src/chemtexteller/graph_matching_eval.py`: `struct.line -> graph_em`, `struct -> graph_structure_em`, `base -> graph_base_sent_acc`.
+- Metric mapping in `src/chemtexteller/graph_matching_eval.py`: `struct.line -> graph_em` paper EM, `struct -> graph_structure_em` paper Structure EM. The wrapper intentionally ignores GraphMatchingTool's `base` block.
 - On Windows use `--graph_num_workers 0` to avoid multiprocessing issues; on Linux GPU servers the default/`8` workers is the intended path.
 
 ## Model And Tokenizer Quirks

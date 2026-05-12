@@ -21,17 +21,24 @@ image_size:
 
 augmentation:
   enabled: true
-  profile: texteller_ocr
-  random_resize_min: 0.75
-  random_resize_max: 1.15
-  rotate_prob: 0.20
-  rotate_degrees: 5.0
-  random_border_max: 25
+  profile: ssml_safe
+  random_resize_min: 0.92
+  random_resize_max: 1.08
+  rotate_prob: 0.00
+  rotate_degrees: 0.0
+  random_border_max: 20
   min_augmented_size: 30
-  augraphy_enabled: true
+  augraphy_enabled: false
+  chemical_crop_prob: 0.00
+  chemical_crop_percent: 0.01
+  chemical_downscale_prob: 0.25
+  chemical_downscale_min: 0.50
+  chemical_downscale_max: 0.75
+  salt_pepper_prob: 0.00
+  salt_pepper_dots: 20
   brightness: 0.05
   contrast: 0.05
-  gaussian_blur_prob: 0.02
+  gaussian_blur_prob: 0.05
   affine_degrees: 1.0
   affine_translate: 0.005
   random_erasing_prob: 0.00

@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as F
@@ -46,6 +46,13 @@ class ImagePreprocessConfig:
     augraphy_enabled: bool = False
     max_augmentation_side: int = 4096
     log_augmentation_downscale: bool = False
+    chemical_crop_prob: float = 0.0
+    chemical_crop_percent: float = 0.01
+    chemical_downscale_prob: float = 0.35
+    chemical_downscale_min: float = 0.50
+    chemical_downscale_max: float = 0.75
+    salt_pepper_prob: float = 0.0
+    salt_pepper_dots: int = 20
 
 
 def _as_tuple(value: Any, channels: int) -> tuple[float, ...] | None:
@@ -93,6 +100,13 @@ def image_config_from_dict(config: dict[str, Any]) -> ImagePreprocessConfig:
         augraphy_enabled=bool(aug.get("augraphy_enabled", False)),
         max_augmentation_side=int(aug.get("max_augmentation_side", 4096)),
         log_augmentation_downscale=bool(aug.get("log_augmentation_downscale", False)),
+        chemical_crop_prob=float(aug.get("chemical_crop_prob", 0.0)),
+        chemical_crop_percent=float(aug.get("chemical_crop_percent", 0.01)),
+        chemical_downscale_prob=float(aug.get("chemical_downscale_prob", 0.35)),
+        chemical_downscale_min=float(aug.get("chemical_downscale_min", 0.50)),
+        chemical_downscale_max=float(aug.get("chemical_downscale_max", 0.75)),
+        salt_pepper_prob=float(aug.get("salt_pepper_prob", 0.0)),
+        salt_pepper_dots=int(aug.get("salt_pepper_dots", 20)),
     )
 
 
@@ -131,9 +145,24 @@ class ResizePadTransform:
         self.augmentation_profile = cfg.augmentation_profile.lower()
         if self.augmentation_profile in {"texteller", "texteller_ocr", "ocr"}:
             self.augmentation_profile = "texteller_ocr"
-        if self.augmentation_profile not in {"light", "texteller_ocr", "none"}:
+        if self.augmentation_profile in {
+            "chem",
+            "chemical",
+            "chemical_safe",
+            "chem_safe",
+            "molscribe",
+            "molscribe_safe",
+            "ssml",
+            "ssml_safe",
+            "rfl",
+            "rfl_ssml",
+            "chemc",
+            "chemc_ssml",
+        }:
+            self.augmentation_profile = "chemical"
+        if self.augmentation_profile not in {"light", "texteller_ocr", "chemical", "none"}:
             raise ValueError(
-                "augmentation.profile must be 'light', 'texteller_ocr', or 'none'."
+                "augmentation.profile must be 'light', 'texteller_ocr', 'chemical', or 'none'."
             )
         self._augraphy_pipeline: Any | None = None
         use_light_augmentation = (
@@ -182,6 +211,12 @@ class ResizePadTransform:
             and self.augmentation_profile == "texteller_ocr"
         ):
             image = self._augment_texteller_ocr(image)
+        elif (
+            self.train
+            and self.cfg.augmentation_enabled
+            and self.augmentation_profile == "chemical"
+        ):
+            image = self._augment_chemical(image)
         else:
             if self.cfg.trim_white_border:
                 image = self._trim_white_border(image)
@@ -224,23 +259,44 @@ class ResizePadTransform:
                 image = self.gaussian_blur(image)
         return image
 
+    def _augment_chemical(self, image: Image.Image) -> Image.Image:
+        image = self._random_resize(image)
+        if self.cfg.trim_white_border:
+            image = self._trim_white_border(image)
+
+        image = self._rotate_small(image)
+
+        if self.cfg.chemical_crop_prob > 0 and random.random() < self.cfg.chemical_crop_prob:
+            image = self._random_crop_percent(image, self.cfg.chemical_crop_percent)
+
+        image = self._add_white_border(image, self.cfg.random_border_max)
+
+        if (
+            self.cfg.chemical_downscale_prob > 0
+            and random.random() < self.cfg.chemical_downscale_prob
+        ):
+            image = self._random_downscale_restore(
+                image,
+                self.cfg.chemical_downscale_min,
+                self.cfg.chemical_downscale_max,
+            )
+
+        if self.cfg.gaussian_blur_prob > 0 and random.random() < self.cfg.gaussian_blur_prob:
+            image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 0.7)))
+
+        if self.cfg.salt_pepper_prob > 0 and random.random() < self.cfg.salt_pepper_prob:
+            image = self._salt_pepper_noise(image, self.cfg.salt_pepper_dots)
+
+        if self.cfg.trim_white_border:
+            image = self._trim_white_border(image)
+        return image
+
     def _augment_texteller_ocr(self, image: Image.Image) -> Image.Image:
         image = self._random_resize(image)
         if self.cfg.trim_white_border:
             image = self._trim_white_border(image)
 
-        if self.cfg.rotate_prob > 0 and random.random() < self.cfg.rotate_prob:
-            rotate_degrees = self.cfg.rotate_degrees
-            if float(rotate_degrees).is_integer():
-                angle = random.randint(-int(rotate_degrees), int(rotate_degrees))
-            else:
-                angle = random.uniform(-rotate_degrees, rotate_degrees)
-            image = image.rotate(
-                angle,
-                resample=Image.Resampling.BICUBIC,
-                expand=True,
-                fillcolor=(255, 255, 255),
-            )
+        image = self._rotate_small(image)
 
         image = self._add_white_border(image, self.cfg.random_border_max)
 
@@ -296,6 +352,71 @@ class ResizePadTransform:
         new_w = max(1, int(image.width * ratio))
         new_h = max(1, int(image.height * ratio))
         return image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    def _rotate_small(self, image: Image.Image) -> Image.Image:
+        if self.cfg.rotate_prob <= 0 or random.random() >= self.cfg.rotate_prob:
+            return image
+        rotate_degrees = self.cfg.rotate_degrees
+        if float(rotate_degrees).is_integer():
+            angle = random.randint(-int(rotate_degrees), int(rotate_degrees))
+        else:
+            angle = random.uniform(-rotate_degrees, rotate_degrees)
+        return image.rotate(
+            angle,
+            resample=Image.Resampling.BICUBIC,
+            expand=True,
+            fillcolor=(255, 255, 255),
+        )
+
+    def _random_crop_percent(self, image: Image.Image, crop_percent: float) -> Image.Image:
+        crop_percent = max(0.0, float(crop_percent))
+        if crop_percent <= 0:
+            return image
+        max_crop_w = min(image.width // 20, int(round(image.width * crop_percent)))
+        max_crop_h = min(image.height // 20, int(round(image.height * crop_percent)))
+        if max_crop_w <= 0 and max_crop_h <= 0:
+            return image
+        left = random.randint(0, max_crop_w) if max_crop_w > 0 else 0
+        right = random.randint(0, max_crop_w) if max_crop_w > 0 else 0
+        top = random.randint(0, max_crop_h) if max_crop_h > 0 else 0
+        bottom = random.randint(0, max_crop_h) if max_crop_h > 0 else 0
+        if left + right >= image.width or top + bottom >= image.height:
+            return image
+        return image.crop((left, top, image.width - right, image.height - bottom))
+
+    def _random_downscale_restore(
+        self,
+        image: Image.Image,
+        min_scale: float,
+        max_scale: float,
+    ) -> Image.Image:
+        min_scale = max(0.05, float(min_scale))
+        max_scale = max(min_scale, float(max_scale))
+        scale = random.uniform(min_scale, max_scale)
+        if scale >= 0.999:
+            return image
+        original_size = image.size
+        small_size = (
+            max(1, int(round(image.width * scale))),
+            max(1, int(round(image.height * scale))),
+        )
+        image = image.resize(small_size, Image.Resampling.BILINEAR)
+        return image.resize(original_size, Image.Resampling.BILINEAR)
+
+    def _salt_pepper_noise(self, image: Image.Image, num_dots: int) -> Image.Image:
+        num_dots = max(0, int(num_dots))
+        if num_dots <= 0:
+            return image
+        arr = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+        height, width = arr.shape[:2]
+        if height <= 0 or width <= 0:
+            return image
+        for _ in range(random.randint(0, num_dots)):
+            y = random.randrange(height)
+            x = random.randrange(width)
+            value = 0 if random.random() < 0.8 else 255
+            arr[y, x] = (value, value, value)
+        return Image.fromarray(arr).convert("RGB")
 
     def _add_white_border(self, image: Image.Image, max_size: int) -> Image.Image:
         max_size = max(0, int(max_size))
