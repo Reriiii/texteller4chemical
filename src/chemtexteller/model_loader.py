@@ -304,26 +304,32 @@ def _configure_special_token_ids(
     tokenizer: PreTrainedTokenizerBase,
 ) -> None:
     config = getattr(model, "config", None)
-    if config is None:
-        return
-    if getattr(config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
-        config.pad_token_id = tokenizer.pad_token_id
-    if getattr(config, "eos_token_id", None) is None and tokenizer.eos_token_id is not None:
-        config.eos_token_id = tokenizer.eos_token_id
-    decoder_start = getattr(config, "decoder_start_token_id", None)
-    if decoder_start is None:
-        if tokenizer.bos_token_id is not None:
-            config.decoder_start_token_id = tokenizer.bos_token_id
-        elif tokenizer.cls_token_id is not None:
-            config.decoder_start_token_id = tokenizer.cls_token_id
-        elif tokenizer.eos_token_id is not None:
-            config.decoder_start_token_id = tokenizer.eos_token_id
+    generation_config = getattr(model, "generation_config", None)
 
-    decoder_cfg = getattr(config, "decoder", None)
+    decoder_start = None
+    for name in ("bos_token_id", "cls_token_id", "eos_token_id"):
+        decoder_start = getattr(tokenizer, name, None)
+        if decoder_start is not None:
+            break
+
+    def align_config_ids(config_obj) -> None:
+        if config_obj is None:
+            return
+        for name in ("pad_token_id", "eos_token_id", "bos_token_id"):
+            value = getattr(tokenizer, name, None)
+            if value is not None:
+                setattr(config_obj, name, value)
+        if decoder_start is not None:
+            setattr(config_obj, "decoder_start_token_id", decoder_start)
+
+    align_config_ids(config)
+    align_config_ids(generation_config)
+
+    decoder_cfg = getattr(config, "decoder", None) if config is not None else None
     if decoder_cfg is not None:
         for name in ("pad_token_id", "eos_token_id", "bos_token_id"):
             value = getattr(tokenizer, name, None)
-            if value is not None and getattr(decoder_cfg, name, None) is None:
+            if value is not None:
                 setattr(decoder_cfg, name, value)
 
 

@@ -111,18 +111,20 @@ def generation_kwargs(
         "use_cache": True,
     }
 
-    for name in ("pad_token_id", "eos_token_id"):
-        value = _configured_token_id(model, name)
+    for name in ("pad_token_id", "eos_token_id", "bos_token_id"):
+        value = _tokenizer_token_id(tokenizer, name)
         if value is None:
-            value = _tokenizer_token_id(tokenizer, name)
+            value = _configured_token_id(model, name)
         if value is not None:
             kwargs[name] = value
 
-    decoder_start = _configured_token_id(model, "decoder_start_token_id")
-    if decoder_start is None:
-        decoder_start = _tokenizer_token_id(tokenizer, "bos_token_id")
+    decoder_start = _tokenizer_token_id(tokenizer, "bos_token_id")
     if decoder_start is None:
         decoder_start = _tokenizer_token_id(tokenizer, "cls_token_id")
+    if decoder_start is None:
+        decoder_start = _tokenizer_token_id(tokenizer, "eos_token_id")
+    if decoder_start is None:
+        decoder_start = _configured_token_id(model, "decoder_start_token_id")
     if decoder_start is not None:
         kwargs["decoder_start_token_id"] = decoder_start
     return kwargs
