@@ -107,12 +107,27 @@ def generation_kwargs(
     tokenizer: Any,
     num_beams: int,
     max_new_tokens: int,
+    length_penalty: float | None = None,
+    early_stopping: bool | None = None,
+    min_new_tokens: int | None = None,
+    no_repeat_ngram_size: int | None = None,
+    repetition_penalty: float | None = None,
 ) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "num_beams": num_beams,
         "max_new_tokens": max_new_tokens,
         "use_cache": True,
     }
+    if length_penalty is not None:
+        kwargs["length_penalty"] = length_penalty
+    if early_stopping is not None:
+        kwargs["early_stopping"] = early_stopping
+    if min_new_tokens is not None and min_new_tokens > 0:
+        kwargs["min_new_tokens"] = min_new_tokens
+    if no_repeat_ngram_size is not None and no_repeat_ngram_size > 0:
+        kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+    if repetition_penalty is not None and repetition_penalty > 0:
+        kwargs["repetition_penalty"] = repetition_penalty
 
     for name in ("pad_token_id", "eos_token_id", "bos_token_id"):
         value = _tokenizer_token_id(tokenizer, name)

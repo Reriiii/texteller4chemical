@@ -102,6 +102,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument(
+        "--length_penalty",
+        type=float,
+        default=None,
+        help="Optional generation length_penalty. Useful for beam-search decoding sweeps.",
+    )
+    parser.add_argument(
+        "--early_stopping",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optional beam-search early_stopping override.",
+    )
+    parser.add_argument(
+        "--min_new_tokens",
+        type=int,
+        default=None,
+        help="Optional generation min_new_tokens. Use carefully; it can force overlong outputs.",
+    )
+    parser.add_argument(
+        "--no_repeat_ngram_size",
+        type=int,
+        default=None,
+        help="Optional generation no_repeat_ngram_size override.",
+    )
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=None,
+        help="Optional generation repetition_penalty override.",
+    )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument(
@@ -300,6 +330,11 @@ def main() -> None:
         bundle.tokenizer,
         num_beams=args.num_beams,
         max_new_tokens=args.max_new_tokens,
+        length_penalty=args.length_penalty,
+        early_stopping=args.early_stopping,
+        min_new_tokens=args.min_new_tokens,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+        repetition_penalty=args.repetition_penalty,
     )
     autocast_ctx = autocast_context(device, inference_dtype)
     with torch.inference_mode(), autocast_ctx:

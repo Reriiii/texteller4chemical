@@ -2,6 +2,9 @@ seed: 42
 max_target_length: 1024
 
 data:
+  target_key: targets.ssml_sd
+  train_target_key: targets.ssml_sd
+  eval_target_key: targets.ssml_sd
   target_length_policy: filter
 
 image_size:
@@ -18,24 +21,19 @@ image_size:
 
 augmentation:
   enabled: true
-  profile: ssml_safe
-  random_resize_min: 0.92
-  random_resize_max: 1.08
-  rotate_prob: 0.00
-  rotate_degrees: 0.0
-  random_border_max: 20
+  profile: texteller_ocr
+  random_resize_min: 0.75
+  random_resize_max: 1.15
+  rotate_prob: 0.20
+  rotate_degrees: 5.0
+  random_border_max: 25
   min_augmented_size: 30
-  augraphy_enabled: false
-  chemical_crop_prob: 0.00
-  chemical_crop_percent: 0.01
-  chemical_downscale_prob: 0.25
-  chemical_downscale_min: 0.50
-  chemical_downscale_max: 0.75
-  salt_pepper_prob: 0.00
-  salt_pepper_dots: 20
+  augraphy_enabled: true
+  max_augmentation_side: 4096
+  log_augmentation_downscale: false
   brightness: 0.05
   contrast: 0.05
-  gaussian_blur_prob: 0.05
+  gaussian_blur_prob: 0.02
   affine_degrees: 1.0
   affine_translate: 0.005
   random_erasing_prob: 0.00
@@ -44,20 +42,20 @@ sampling:
   length_balanced:
     enabled: true
     bins:
-      - max_length: 256
+      - max_length: 192
         weight: 1.0
-      - max_length: 512
+      - max_length: 384
         weight: 1.5
-      - max_length: 768
-        weight: 3.0
+      - max_length: 640
+        weight: 2.5
       - max_length: 1024
-        weight: 4.0
+        weight: 3.5
       - max_length: null
-        weight: 4.0
+        weight: 3.5
 
 training:
   num_train_epochs: 30
-  learning_rate: 5.0e-4
+  learning_rate: 3.0e-5
   weight_decay: 0.01
   warmup_steps: 3000
   lr_scheduler_type: cosine
@@ -85,7 +83,7 @@ training:
   tqdm_miniters: 10
   tqdm_ncols: 100
   tqdm_ascii: false
-  save_total_limit: 2
+  save_total_limit: 3
   eval_strategy: epoch
   save_strategy: epoch
   load_best_model_at_end: true
