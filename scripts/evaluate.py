@@ -545,7 +545,13 @@ def main() -> None:
     references = [str(row["ground_truth"]) for row in rows]
     metrics = sequence_metrics(predictions, references)
     if two_pass_cfg is not None and rows:
+        two_pass_triggered = sum(bool(str(row["two_pass_reason"]).strip()) for row in rows)
+        two_pass_cropped = sum(int(row["two_pass_crops"] or 0) >= 2 for row in rows)
         two_pass_used = sum(str(row["two_pass_used"]).lower() == "true" for row in rows)
+        metrics["two_pass_triggered"] = two_pass_triggered
+        metrics["two_pass_triggered_rate"] = two_pass_triggered / len(rows)
+        metrics["two_pass_cropped"] = two_pass_cropped
+        metrics["two_pass_cropped_rate"] = two_pass_cropped / len(rows)
         metrics["two_pass_used"] = two_pass_used
         metrics["two_pass_used_rate"] = two_pass_used / len(rows)
     if args.prediction_normalizer:
