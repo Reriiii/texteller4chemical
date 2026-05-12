@@ -232,6 +232,25 @@ def normalize_prediction(prediction: str, normalizer: str | None) -> str:
     return normalize_target_for_field(prediction, normalizer)
 
 
+def log_inference_preprocessing(config: dict[str, object]) -> None:
+    image_cfg = config.get("image_size", {})
+    if not isinstance(image_cfg, dict):
+        logger.info("Inference preprocessing | image_size config is not a mapping: %r", image_cfg)
+        return
+    logger.info(
+        "Inference preprocessing | size=%sx%s channels=%s resize_mode=%s "
+        "pad_position=%s trim_white_border=%s normalize_mean=%s normalize_std=%s",
+        image_cfg.get("height"),
+        image_cfg.get("width"),
+        image_cfg.get("channels"),
+        image_cfg.get("resize_mode"),
+        image_cfg.get("pad_position"),
+        image_cfg.get("trim_white_border"),
+        image_cfg.get("normalize_mean"),
+        image_cfg.get("normalize_std"),
+    )
+
+
 def write_rows(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -263,6 +282,7 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     config = load_inference_config(args.model_ckpt, args.config, args.max_new_tokens)
+    log_inference_preprocessing(config)
     target_key = resolve_eval_target_key(config, args.target_key)
     bundle = load_pretrained_model_and_tokenizer(
         model_name_or_path=str(args.model_ckpt),
@@ -335,6 +355,10 @@ def main() -> None:
         min_new_tokens=args.min_new_tokens,
         no_repeat_ngram_size=args.no_repeat_ngram_size,
         repetition_penalty=args.repetition_penalty,
+    )
+    logger.info(
+        "Generation kwargs | %s",
+        ", ".join(f"{key}={value!r}" for key, value in sorted(gen_kwargs.items())),
     )
     autocast_ctx = autocast_context(device, inference_dtype)
     with torch.inference_mode(), autocast_ctx:

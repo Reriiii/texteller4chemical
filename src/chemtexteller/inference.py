@@ -13,15 +13,30 @@ from .utils import get_logger, load_yaml
 logger = get_logger("inference")
 
 DEFAULT_INFERENCE_CONFIG: dict[str, Any] = {
-    "max_target_length": 768,
+    "max_target_length": 1024,
     "image_size": {
         "height": 448,
         "width": 448,
         "channels": 1,
         "pad_value": 255,
+        "trim_white_border": True,
+        "trim_threshold": 15,
+        "resize_mode": "texteller",
+        "pad_position": "top_left",
+        "normalize_mean": 0.9545467,
+        "normalize_std": 0.15394445,
     },
     "augmentation": {"enabled": False},
 }
+
+
+def _candidate_config_paths(model_ckpt: Path) -> list[Path]:
+    return [
+        model_ckpt / "train_config.yaml",
+        model_ckpt / "source_config.yaml",
+        model_ckpt.parent / "train_config.yaml",
+        model_ckpt.parent / "source_config.yaml",
+    ]
 
 
 def load_inference_config(
@@ -30,13 +45,17 @@ def load_inference_config(
     max_new_tokens: int,
 ) -> dict[str, Any]:
     if config_path is not None:
+        logger.info("Using inference config from explicit --config: %s", config_path)
         return load_yaml(config_path)
-    candidate = model_ckpt / "train_config.yaml"
-    if candidate.exists():
-        return load_yaml(candidate)
-    parent_candidate = model_ckpt.parent / "train_config.yaml"
-    if parent_candidate.exists():
-        return load_yaml(parent_candidate)
+    for candidate in _candidate_config_paths(model_ckpt):
+        if candidate.exists():
+            logger.info("Using inference config from checkpoint metadata: %s", candidate)
+            return load_yaml(candidate)
+    logger.warning(
+        "No train/source config found under %s or its parent; using TexTeller default "
+        "inference preprocessing. Pass --config to avoid accidental train/eval mismatch.",
+        model_ckpt,
+    )
     config = deepcopy(DEFAULT_INFERENCE_CONFIG)
     config["max_target_length"] = max_new_tokens
     return config

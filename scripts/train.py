@@ -721,8 +721,12 @@ def main() -> None:
     config = load_yaml(args.config)
     set_seed(int(config.get("seed", 42)))
     ensure_dir(args.output_dir)
+    save_yaml(config, args.output_dir / "train_config.yaml")
+    shutil.copy2(args.config, args.output_dir / "source_config.yaml")
+    save_json(vars(args), args.output_dir / "training_args.json")
     logger.info("Writing run log to %s", log_file)
     logger.info("Writing trainer event log to %s", event_log_file)
+    logger.info("Saved run config metadata to %s", args.output_dir)
 
     if args.from_scratch:
         raise SystemExit(
@@ -829,7 +833,6 @@ def main() -> None:
 
     save_yaml(config, args.output_dir / "train_config.yaml")
     save_yaml(config, best_dir / "train_config.yaml")
-    shutil.copy2(args.config, args.output_dir / "source_config.yaml")
     save_json(vars(args), args.output_dir / "training_args.json")
     save_json({"model_type": bundle.model_type, "source": bundle.source}, args.output_dir / "model_loader.json")
     (args.output_dir / "trainer_state_summary.json").write_text(
