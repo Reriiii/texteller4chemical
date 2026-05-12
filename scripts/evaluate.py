@@ -182,8 +182,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--two_pass_selection",
-        choices=["syntax_or_longer", "syntax", "always", "never"],
-        default="syntax_or_longer",
+        choices=["syntax_strict", "syntax_or_longer", "syntax", "always", "never"],
+        default="syntax_strict",
         help="How to choose whether stitched component output replaces the first pass.",
     )
     parser.add_argument(
@@ -191,6 +191,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help="Minimum stitched-token length gain used by syntax_or_longer selection.",
+    )
+    parser.add_argument(
+        "--two_pass_min_length_ratio",
+        type=float,
+        default=0.70,
+        help="Reject stitched output shorter than this token-count ratio versus the first pass.",
+    )
+    parser.add_argument(
+        "--two_pass_max_length_ratio",
+        type=float,
+        default=1.25,
+        help="Reject stitched output longer than this token-count ratio versus the first pass.",
     )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
@@ -326,6 +338,8 @@ def two_pass_config_from_args(args: argparse.Namespace) -> TwoPassDecodeConfig:
         crop_max_new_tokens=crop_max_new_tokens,
         selection=str(args.two_pass_selection),
         min_length_gain_tokens=int(args.two_pass_min_length_gain_tokens),
+        min_length_ratio=float(args.two_pass_min_length_ratio),
+        max_length_ratio=float(args.two_pass_max_length_ratio),
     )
 
 

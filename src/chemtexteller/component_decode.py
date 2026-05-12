@@ -25,8 +25,10 @@ class TwoPassDecodeConfig:
     max_crops: int = 5
     min_crop_width: int = 128
     crop_max_new_tokens: int | None = 512
-    selection: str = "syntax_or_longer"
+    selection: str = "syntax_strict"
     min_length_gain_tokens: int = 20
+    min_length_ratio: float = 0.70
+    max_length_ratio: float = 1.25
     trim_threshold: int = 15
 
 
@@ -217,6 +219,16 @@ def should_use_stitched_prediction(
 
     first_stats = syntax_stats(first_pass_prediction)
     stitched_stats = syntax_stats(stitched_prediction)
+    if not _length_ratio_ok(first_stats, stitched_stats, cfg):
+        return False
+
+    if selection == "syntax_strict":
+        return (
+            not first_stats.validish
+            and stitched_stats.validish
+            and stitched_stats.score >= first_stats.score + 3
+        )
+
     if selection == "syntax":
         return stitched_stats.score > first_stats.score
 
@@ -231,6 +243,17 @@ def should_use_stitched_prediction(
     ):
         return True
     return False
+
+
+def _length_ratio_ok(
+    first_stats: SyntaxStats,
+    stitched_stats: SyntaxStats,
+    cfg: TwoPassDecodeConfig,
+) -> bool:
+    if first_stats.token_count <= 0 or stitched_stats.token_count <= 0:
+        return stitched_stats.token_count > 0
+    ratio = stitched_stats.token_count / first_stats.token_count
+    return cfg.min_length_ratio <= ratio <= cfg.max_length_ratio
 
 
 def _crop_generation_kwargs(
