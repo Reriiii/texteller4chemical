@@ -694,12 +694,17 @@ class ChemSeq2SeqTrainer(Seq2SeqTrainer):
         *args: Any,
         length_balanced_sampling: dict[str, Any] | None = None,
         eval_generation_metrics: EvalGenerationMetricRunner | None = None,
+        cuda_memory_log_steps: int = 0,
+        cuda_empty_cache_steps: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.length_balanced_sampling = length_balanced_sampling
         self._length_balanced_weights: torch.DoubleTensor | None = None
         self.eval_generation_metrics = eval_generation_metrics
+        self.cuda_memory_log_steps = max(0, int(cuda_memory_log_steps))
+        self.cuda_empty_cache_steps = max(0, int(cuda_empty_cache_steps))
+        self._raw_training_step_count = 0
 
     def evaluate(
         self,
@@ -723,6 +728,41 @@ class ChemSeq2SeqTrainer(Seq2SeqTrainer):
                 self.log(generation_metrics)
         cleanup_cuda_memory()
         return metrics
+
+    def training_step(self, model: torch.nn.Module, inputs: dict[str, Any], *args: Any, **kwargs: Any):
+        label_max_len = None
+        labels = inputs.get("labels")
+        if isinstance(labels, torch.Tensor) and labels.ndim >= 2:
+            label_max_len = int(labels.shape[-1])
+
+        loss = super().training_step(model, inputs, *args, **kwargs)
+        self._raw_training_step_count += 1
+
+        if torch.cuda.is_available():
+            if (
+                self.cuda_memory_log_steps > 0
+                and self._raw_training_step_count % self.cuda_memory_log_steps == 0
+                and self.is_world_process_zero()
+            ):
+                allocated = torch.cuda.memory_allocated() / (1024**3)
+                reserved = torch.cuda.memory_reserved() / (1024**3)
+                peak = torch.cuda.max_memory_allocated() / (1024**3)
+                logger.info(
+                    "CUDA memory | raw_step=%s global_step=%s label_max_len=%s "
+                    "allocated=%.2fGiB reserved=%.2fGiB peak_allocated=%.2fGiB",
+                    self._raw_training_step_count,
+                    self.state.global_step,
+                    label_max_len,
+                    allocated,
+                    reserved,
+                    peak,
+                )
+            if (
+                self.cuda_empty_cache_steps > 0
+                and self._raw_training_step_count % self.cuda_empty_cache_steps == 0
+            ):
+                cleanup_cuda_memory()
+        return loss
 
     def _get_train_sampler(self):
         if self.length_balanced_sampling is None:
@@ -1105,6 +1145,8 @@ def main() -> None:
             output_dir=args.output_dir,
             cfg=config.get("eval_metrics", {}),
         ),
+        cuda_memory_log_steps=int(training_cfg.get("cuda_memory_log_steps", 0)),
+        cuda_empty_cache_steps=int(training_cfg.get("cuda_empty_cache_steps", 0)),
         **trainer_kwargs_for_processing_class(bundle.tokenizer),
     )
     configure_progress_callback(trainer, training_cfg)
