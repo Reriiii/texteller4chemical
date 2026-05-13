@@ -126,6 +126,7 @@ def generation_kwargs(
     tokenizer: Any,
     num_beams: int,
     max_new_tokens: int,
+    use_cache: bool = True,
     length_penalty: float | None = None,
     early_stopping: bool | None = None,
     min_new_tokens: int | None = None,
@@ -135,7 +136,7 @@ def generation_kwargs(
     kwargs: dict[str, object] = {
         "num_beams": num_beams,
         "max_new_tokens": max_new_tokens,
-        "use_cache": True,
+        "use_cache": use_cache,
     }
     if length_penalty is not None:
         kwargs["length_penalty"] = length_penalty

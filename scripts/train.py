@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import inspect
 import json
 import math
@@ -64,6 +65,12 @@ from chemtexteller.utils import ensure_dir, load_yaml, save_json, save_yaml, set
 
 logger = setup_logging()
 transformers_logging.set_verbosity_error()
+
+
+def cleanup_cuda_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 DEFAULT_LORA_TARGET_LEAVES = (
@@ -522,6 +529,7 @@ class EvalGenerationMetricRunner:
             tokenizer=self.tokenizer,
             num_beams=int(self.cfg.get("num_beams", 1)),
             max_new_tokens=int(self.cfg.get("max_new_tokens", 1024)),
+            use_cache=bool(self.cfg.get("use_cache", True)),
             length_penalty=self.cfg.get("length_penalty"),
             early_stopping=self.cfg.get("early_stopping"),
             min_new_tokens=self.cfg.get("min_new_tokens"),
@@ -557,6 +565,8 @@ class EvalGenerationMetricRunner:
                         generated,
                         skip_special_tokens=True,
                     )
+                    del generated
+                    del pixel_values
                     for image_name, target, metadata_targets, prediction in zip(
                         batch["image_names"],
                         batch["targets"],
@@ -584,6 +594,8 @@ class EvalGenerationMetricRunner:
             set_generation_cache(model, enabled=False)
             if was_training:
                 model.train()
+            if bool(self.cfg.get("empty_cache", True)):
+                cleanup_cuda_memory()
 
         metrics = sequence_metrics(predictions, references)
         output_metrics: dict[str, float | int | str] = {
@@ -700,6 +712,7 @@ class ChemSeq2SeqTrainer(Seq2SeqTrainer):
             ignore_keys=ignore_keys,
             metric_key_prefix=metric_key_prefix,
         )
+        cleanup_cuda_memory()
         if self.eval_generation_metrics is not None:
             generation_metrics = self.eval_generation_metrics.compute(
                 self,
@@ -708,6 +721,7 @@ class ChemSeq2SeqTrainer(Seq2SeqTrainer):
             if generation_metrics:
                 metrics.update(generation_metrics)
                 self.log(generation_metrics)
+        cleanup_cuda_memory()
         return metrics
 
     def _get_train_sampler(self):
