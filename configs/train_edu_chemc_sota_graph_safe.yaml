@@ -92,6 +92,19 @@ training:
   report_to:
     - tensorboard
 
+eval_metrics:
+  enabled: true
+  batch_size: 16
+  max_samples: null
+  sample_seed: null
+  num_beams: 3
+  max_new_tokens: 1024
+  graph_eval: true
+  graph_matching_tool_dir: external/GraphMatchingTool
+  graph_label_key: ssml_sd
+  graph_num_workers: 8
+  require_graph_eval: false
+
 lora:
   enabled: false
   r: 32

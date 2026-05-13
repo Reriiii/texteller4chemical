@@ -53,6 +53,13 @@ class ImagePreprocessConfig:
     chemical_downscale_max: float = 0.75
     salt_pepper_prob: float = 0.0
     salt_pepper_dots: int = 20
+    molscribe_crop_prob: float = 0.50
+    molscribe_crop_percent: float = 0.01
+    molscribe_pad_prob: float = 0.20
+    molscribe_pad_ratio: float = 0.40
+    molscribe_downscale_prob: float = 0.50
+    molscribe_downscale_min: float = 0.20
+    molscribe_downscale_max: float = 0.50
 
 
 def _as_tuple(value: Any, channels: int) -> tuple[float, ...] | None:
@@ -107,6 +114,13 @@ def image_config_from_dict(config: dict[str, Any]) -> ImagePreprocessConfig:
         chemical_downscale_max=float(aug.get("chemical_downscale_max", 0.75)),
         salt_pepper_prob=float(aug.get("salt_pepper_prob", 0.0)),
         salt_pepper_dots=int(aug.get("salt_pepper_dots", 20)),
+        molscribe_crop_prob=float(aug.get("molscribe_crop_prob", 0.50)),
+        molscribe_crop_percent=float(aug.get("molscribe_crop_percent", 0.01)),
+        molscribe_pad_prob=float(aug.get("molscribe_pad_prob", 0.20)),
+        molscribe_pad_ratio=float(aug.get("molscribe_pad_ratio", 0.40)),
+        molscribe_downscale_prob=float(aug.get("molscribe_downscale_prob", 0.50)),
+        molscribe_downscale_min=float(aug.get("molscribe_downscale_min", 0.20)),
+        molscribe_downscale_max=float(aug.get("molscribe_downscale_max", 0.50)),
     )
 
 
@@ -150,8 +164,6 @@ class ResizePadTransform:
             "chemical",
             "chemical_safe",
             "chem_safe",
-            "molscribe",
-            "molscribe_safe",
             "ssml",
             "ssml_safe",
             "rfl",
@@ -160,9 +172,18 @@ class ResizePadTransform:
             "chemc_ssml",
         }:
             self.augmentation_profile = "chemical"
-        if self.augmentation_profile not in {"light", "texteller_ocr", "chemical", "none"}:
+        if self.augmentation_profile in {"molscribe", "molscribe_safe"}:
+            self.augmentation_profile = "molscribe"
+        if self.augmentation_profile not in {
+            "light",
+            "texteller_ocr",
+            "chemical",
+            "molscribe",
+            "none",
+        }:
             raise ValueError(
-                "augmentation.profile must be 'light', 'texteller_ocr', 'chemical', or 'none'."
+                "augmentation.profile must be 'light', 'texteller_ocr', 'chemical', "
+                "'molscribe', or 'none'."
             )
         self._augraphy_pipeline: Any | None = None
         use_light_augmentation = (
@@ -217,6 +238,12 @@ class ResizePadTransform:
             and self.augmentation_profile == "chemical"
         ):
             image = self._augment_chemical(image)
+        elif (
+            self.train
+            and self.cfg.augmentation_enabled
+            and self.augmentation_profile == "molscribe"
+        ):
+            image = self._augment_molscribe(image)
         else:
             if self.cfg.trim_white_border:
                 image = self._trim_white_border(image)
@@ -306,6 +333,51 @@ class ResizePadTransform:
 
         # TexTeller applies the normal inference transform after OCR augmentation;
         # that transform trims the border again before grayscale/resize/pad.
+        if self.cfg.trim_white_border:
+            image = self._trim_white_border(image)
+        return image
+
+    def _augment_molscribe(self, image: Image.Image) -> Image.Image:
+        # MolScribe-style augmentation: crop-white, safe rotate, small crop/pad,
+        # downscale degradation, blur, and sparse salt-pepper noise.
+        if self.cfg.trim_white_border:
+            image = self._trim_white_border(image)
+        image = self._rotate_small(image)
+        if self.cfg.trim_white_border:
+            image = self._trim_white_border(image)
+        image = self._add_white_border(image, 5)
+
+        if (
+            self.cfg.molscribe_crop_prob > 0
+            and random.random() < self.cfg.molscribe_crop_prob
+        ):
+            image = self._random_crop_percent(image, self.cfg.molscribe_crop_percent)
+
+        if (
+            self.cfg.molscribe_pad_prob > 0
+            and random.random() < self.cfg.molscribe_pad_prob
+        ):
+            image = self._add_random_side_border_ratio(
+                image,
+                self.cfg.molscribe_pad_ratio,
+            )
+
+        if (
+            self.cfg.molscribe_downscale_prob > 0
+            and random.random() < self.cfg.molscribe_downscale_prob
+        ):
+            image = self._random_downscale_restore(
+                image,
+                self.cfg.molscribe_downscale_min,
+                self.cfg.molscribe_downscale_max,
+            )
+
+        if self.cfg.gaussian_blur_prob > 0 and random.random() < self.cfg.gaussian_blur_prob:
+            image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 0.8)))
+
+        if self.cfg.salt_pepper_prob > 0 and random.random() < self.cfg.salt_pepper_prob:
+            image = self._salt_pepper_noise(image, self.cfg.salt_pepper_dots)
+
         if self.cfg.trim_white_border:
             image = self._trim_white_border(image)
         return image
@@ -431,6 +503,23 @@ class ResizePadTransform:
             extra = int((self.cfg.min_augmented_size - (pad_w + image.width)) * 0.5) + 1
             left += extra
             right += extra
+        return ImageOps.expand(
+            image.convert("RGB"),
+            border=(left, top, right, bottom),
+            fill=(255, 255, 255),
+        )
+
+    def _add_random_side_border_ratio(self, image: Image.Image, ratio: float) -> Image.Image:
+        ratio = max(0.0, float(ratio))
+        if ratio <= 0:
+            return image
+        side = random.randrange(4)
+        pads = [0, 0, 0, 0]
+        if side in {0, 1}:
+            pads[side] = int(round(image.height * ratio * random.random()))
+        else:
+            pads[side] = int(round(image.width * ratio * random.random()))
+        left, top, right, bottom = pads[2], pads[0], pads[3], pads[1]
         return ImageOps.expand(
             image.convert("RGB"),
             border=(left, top, right, bottom),

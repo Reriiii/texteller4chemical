@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import inspect
 import json
 import math
 import os
+import random
 import shutil
 import sys
 import warnings
@@ -23,7 +25,7 @@ warnings.filterwarnings("ignore", message=r".*find_unused_parameters=True.*")
 
 import torch
 from tqdm.auto import tqdm
-from torch.utils.data import WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from transformers.utils import logging as transformers_logging
 from transformers.trainer_callback import PrinterCallback, ProgressCallback, TrainerCallback
@@ -35,7 +37,20 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from chemtexteller.data import EduChemcDataset, VisionSeq2SeqCollator
-from chemtexteller.inference import set_generation_cache
+from chemtexteller.graph_matching_eval import (
+    lookup_target,
+    run_graph_matching_tool,
+    validate_graph_matching_tool,
+    write_graph_matching_files,
+)
+from chemtexteller.inference import (
+    autocast_context,
+    generate_from_pixel_values,
+    generation_kwargs,
+    move_pixel_values,
+    set_generation_cache,
+)
+from chemtexteller.metrics import sequence_metrics
 from chemtexteller.model_loader import (
     add_texteller_repo_to_path,
     enable_gradient_checkpointing_if_available,
@@ -412,16 +427,288 @@ def _build_length_balanced_weights(dataset: Any, cfg: dict[str, Any]) -> torch.D
     return torch.as_tensor(weights, dtype=torch.double)
 
 
+def _resolve_inference_dtype_from_args(args: Seq2SeqTrainingArguments) -> torch.dtype | None:
+    if not torch.cuda.is_available():
+        return None
+    if bool(getattr(args, "bf16", False)):
+        return torch.bfloat16
+    if bool(getattr(args, "fp16", False)):
+        return torch.float16
+    return None
+
+
+class EvalGenerationMetricRunner:
+    def __init__(
+        self,
+        *,
+        dataset: EduChemcDataset,
+        tokenizer: Any,
+        output_dir: Path,
+        cfg: dict[str, Any],
+    ) -> None:
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.output_dir = output_dir
+        self.cfg = cfg
+        self._graph_warning_emitted = False
+        self._distributed_warning_emitted = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cfg.get("enabled", False))
+
+    def compute(
+        self,
+        trainer: Seq2SeqTrainer,
+        metric_key_prefix: str = "eval",
+    ) -> dict[str, float | int | str]:
+        if not self.enabled:
+            return {}
+        if int(getattr(trainer.args, "world_size", 1)) != 1:
+            if not self._distributed_warning_emitted and trainer.is_world_process_zero():
+                logger.warning(
+                    "Skipping eval generation metrics because world_size=%s. "
+                    "Run with --num_processes 1 for EM/graph EM during training.",
+                    trainer.args.world_size,
+                )
+                self._distributed_warning_emitted = True
+            return {}
+        if not trainer.is_world_process_zero():
+            return {}
+
+        max_samples = self.cfg.get("max_samples")
+        indices = list(range(len(self.dataset)))
+        sample_seed = self.cfg.get("sample_seed")
+        if sample_seed is not None:
+            rng = random.Random(int(sample_seed))
+            rng.shuffle(indices)
+        if max_samples is not None:
+            indices = indices[: int(max_samples)]
+        if not indices:
+            return {}
+
+        batch_size = int(
+            self.cfg.get(
+                "batch_size",
+                getattr(trainer.args, "per_device_eval_batch_size", 4),
+            )
+        )
+        num_workers = int(self.cfg.get("dataloader_num_workers", 0))
+        loader_kwargs: dict[str, Any] = {
+            "batch_size": batch_size,
+            "shuffle": False,
+            "collate_fn": VisionSeq2SeqCollator(self.tokenizer, include_metadata=True),
+            "num_workers": num_workers,
+            "pin_memory": bool(self.cfg.get("pin_memory", trainer.args.dataloader_pin_memory)),
+        }
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = bool(
+                self.cfg.get("dataloader_persistent_workers", False)
+            )
+        loader = DataLoader(Subset(self.dataset, indices), **loader_kwargs)
+
+        model = trainer.model
+        if hasattr(trainer, "accelerator"):
+            with contextlib.suppress(Exception):
+                model = trainer.accelerator.unwrap_model(model)
+        was_training = model.training
+        model.eval()
+        set_generation_cache(model, enabled=True)
+
+        device = trainer.args.device
+        dtype = _resolve_inference_dtype_from_args(trainer.args)
+        gen_kwargs = generation_kwargs(
+            model=model,
+            tokenizer=self.tokenizer,
+            num_beams=int(self.cfg.get("num_beams", 1)),
+            max_new_tokens=int(self.cfg.get("max_new_tokens", 1024)),
+            length_penalty=self.cfg.get("length_penalty"),
+            early_stopping=self.cfg.get("early_stopping"),
+            min_new_tokens=self.cfg.get("min_new_tokens"),
+            no_repeat_ngram_size=self.cfg.get("no_repeat_ngram_size"),
+            repetition_penalty=self.cfg.get("repetition_penalty"),
+        )
+
+        predictions: list[str] = []
+        references: list[str] = []
+        graph_rows: list[dict[str, str]] = []
+        graph_label_key = str(
+            self.cfg.get(
+                "graph_label_key",
+                self.cfg.get("target_key", "target"),
+            )
+        )
+        progress = tqdm(
+            loader,
+            desc="Eval generation",
+            leave=False,
+            dynamic_ncols=False,
+            ncols=int(self.cfg.get("tqdm_ncols", 100)),
+            disable=not bool(self.cfg.get("tqdm", True)),
+            file=sys.stdout,
+        )
+        started = perf_counter()
+        try:
+            with torch.inference_mode(), autocast_context(device, dtype):
+                for batch in progress:
+                    pixel_values = move_pixel_values(batch["pixel_values"], device, dtype)
+                    generated = generate_from_pixel_values(model, pixel_values, gen_kwargs)
+                    decoded = self.tokenizer.batch_decode(
+                        generated,
+                        skip_special_tokens=True,
+                    )
+                    for image_name, target, metadata_targets, prediction in zip(
+                        batch["image_names"],
+                        batch["targets"],
+                        batch["metadata_targets"],
+                        decoded,
+                        strict=True,
+                    ):
+                        prediction = " ".join(str(prediction).split())
+                        reference = " ".join(str(target).split())
+                        predictions.append(prediction)
+                        references.append(reference)
+                        if bool(self.cfg.get("graph_eval", False)):
+                            try:
+                                graph_label = lookup_target(metadata_targets, graph_label_key)
+                            except KeyError:
+                                continue
+                            graph_rows.append(
+                                {
+                                    "image_name": str(image_name),
+                                    "prediction": prediction,
+                                    "graph_label": graph_label,
+                                }
+                            )
+        finally:
+            set_generation_cache(model, enabled=False)
+            if was_training:
+                model.train()
+
+        metrics = sequence_metrics(predictions, references)
+        output_metrics: dict[str, float | int | str] = {
+            f"{metric_key_prefix}_generation_samples": len(predictions),
+            f"{metric_key_prefix}_generation_runtime": perf_counter() - started,
+            f"{metric_key_prefix}_exact_match": float(metrics["exact_match"]),
+            f"{metric_key_prefix}_normalized_exact_match": float(
+                metrics["normalized_exact_match"]
+            ),
+            f"{metric_key_prefix}_mean_token_edit_distance": float(
+                metrics["mean_token_edit_distance"]
+            ),
+            f"{metric_key_prefix}_mean_normalized_token_edit_distance": float(
+                metrics["mean_normalized_token_edit_distance"]
+            ),
+        }
+
+        graph_metrics = self._graph_metrics(
+            graph_rows=graph_rows,
+            trainer=trainer,
+            metric_key_prefix=metric_key_prefix,
+        )
+        output_metrics.update(graph_metrics)
+        logger.info(
+            "Eval generation metrics | epoch=%.3f step=%s samples=%s EM=%.6f graph_EM=%s structure_EM=%s",
+            trainer.state.epoch or 0.0,
+            trainer.state.global_step,
+            len(predictions),
+            output_metrics[f"{metric_key_prefix}_exact_match"],
+            output_metrics.get(f"{metric_key_prefix}_graph_em", "skipped"),
+            output_metrics.get(f"{metric_key_prefix}_graph_structure_em", "skipped"),
+        )
+        return output_metrics
+
+    def _graph_metrics(
+        self,
+        *,
+        graph_rows: list[dict[str, str]],
+        trainer: Seq2SeqTrainer,
+        metric_key_prefix: str,
+    ) -> dict[str, float | int | str]:
+        if not bool(self.cfg.get("graph_eval", False)):
+            return {}
+        if not graph_rows:
+            return {f"{metric_key_prefix}_graph_samples": 0}
+
+        tool_value = self.cfg.get("graph_matching_tool_dir")
+        if not tool_value:
+            self._warn_graph_skip("eval_metrics.graph_matching_tool_dir is not set.")
+            return {f"{metric_key_prefix}_graph_samples": 0}
+        tool_dir = Path(str(tool_value))
+        if not tool_dir.is_absolute():
+            tool_dir = PROJECT_ROOT / tool_dir
+        try:
+            validate_graph_matching_tool(tool_dir)
+        except FileNotFoundError as exc:
+            if bool(self.cfg.get("require_graph_eval", False)):
+                raise
+            self._warn_graph_skip(str(exc))
+            return {f"{metric_key_prefix}_graph_samples": 0}
+
+        stem = f"step_{trainer.state.global_step:08d}"
+        if trainer.state.epoch is not None:
+            stem += f"_epoch_{trainer.state.epoch:.3f}".replace(".", "_")
+        out_dir = ensure_dir(self.output_dir / "eval_metrics")
+        rec_path = out_dir / f"{stem}.rec.txt"
+        lab_path = out_dir / f"{stem}.lab.txt"
+        graph_output_path = out_dir / f"{stem}.graph_result.txt"
+        write_graph_matching_files(graph_rows, rec_path, lab_path)
+        result = run_graph_matching_tool(
+            tool_dir=tool_dir,
+            rec_path=rec_path,
+            lab_path=lab_path,
+            output_path=graph_output_path,
+            num_workers=int(self.cfg.get("graph_num_workers", 8)),
+        )
+        return {
+            f"{metric_key_prefix}_graph_samples": len(graph_rows),
+            f"{metric_key_prefix}_graph_em": float(result.metrics["graph_em"]),
+            f"{metric_key_prefix}_graph_structure_em": float(
+                result.metrics["graph_structure_em"]
+            ),
+            f"{metric_key_prefix}_graph_output_txt": str(graph_output_path),
+        }
+
+    def _warn_graph_skip(self, message: str) -> None:
+        if self._graph_warning_emitted:
+            return
+        logger.warning("Skipping eval graph metrics: %s", message)
+        self._graph_warning_emitted = True
+
+
 class ChemSeq2SeqTrainer(Seq2SeqTrainer):
     def __init__(
         self,
         *args: Any,
         length_balanced_sampling: dict[str, Any] | None = None,
+        eval_generation_metrics: EvalGenerationMetricRunner | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.length_balanced_sampling = length_balanced_sampling
         self._length_balanced_weights: torch.DoubleTensor | None = None
+        self.eval_generation_metrics = eval_generation_metrics
+
+    def evaluate(
+        self,
+        eval_dataset: Any | None = None,
+        ignore_keys: list[str] | None = None,
+        metric_key_prefix: str = "eval",
+    ) -> dict[str, Any]:
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        if self.eval_generation_metrics is not None:
+            generation_metrics = self.eval_generation_metrics.compute(
+                self,
+                metric_key_prefix=metric_key_prefix,
+            )
+            if generation_metrics:
+                metrics.update(generation_metrics)
+                self.log(generation_metrics)
+        return metrics
 
     def _get_train_sampler(self):
         if self.length_balanced_sampling is None:
@@ -798,6 +1085,12 @@ def main() -> None:
         eval_dataset=eval_dataset,
         data_collator=collator,
         length_balanced_sampling=_length_balanced_cfg(config),
+        eval_generation_metrics=EvalGenerationMetricRunner(
+            dataset=eval_dataset,
+            tokenizer=bundle.tokenizer,
+            output_dir=args.output_dir,
+            cfg=config.get("eval_metrics", {}),
+        ),
         **trainer_kwargs_for_processing_class(bundle.tokenizer),
     )
     configure_progress_callback(trainer, training_cfg)
