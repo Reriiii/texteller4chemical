@@ -110,6 +110,16 @@ def _nonempty_list(value: Any) -> bool:
     return isinstance(value, list) and len(value) > 0
 
 
+def _find_subsequence(values: list[int], subsequence: list[int]) -> int | None:
+    if not subsequence:
+        return 0
+    limit = len(values) - len(subsequence)
+    for start in range(limit + 1):
+        if values[start : start + len(subsequence)] == subsequence:
+            return start
+    return None
+
+
 def _rfl_msd_metadata(aux: dict[str, Any], tokens: list[str]) -> dict[str, Any]:
     msd = aux.get("msd")
     if isinstance(msd, dict):
@@ -227,11 +237,80 @@ class EduChemcDataset(Dataset[dict[str, Any]]):
                 is_split_into_words=True,
                 **tokenizer_kwargs,
             )
-            word_ids = tokenized.word_ids()
-            return tokenized, list(word_ids)
+            word_ids = list(tokenized.word_ids())
+            if any(isinstance(word_idx, int) for word_idx in word_ids):
+                return tokenized, word_ids
         except Exception:
-            tokenized = self.tokenizer(target, **tokenizer_kwargs)
-            return tokenized, None
+            pass
+        try:
+            manual = self._manual_tokenize_rfl_words(rfl_tokens, truncation=truncation)
+            if manual is not None:
+                return manual
+        except Exception:
+            pass
+        tokenized = self.tokenizer(target, **tokenizer_kwargs)
+        return tokenized, None
+
+    def _manual_tokenize_rfl_words(
+        self,
+        rfl_tokens: list[str],
+        *,
+        truncation: bool,
+    ) -> tuple[dict[str, list[int]], list[int | None]] | None:
+        input_ids: list[int] = []
+        word_ids: list[int | None] = []
+        for word_idx, token in enumerate(rfl_tokens):
+            text = token if word_idx == 0 else f" {token}"
+            encoded = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                truncation=False,
+                padding=False,
+            )
+            pieces = encoded.get("input_ids") if isinstance(encoded, dict) else None
+            if not isinstance(pieces, list):
+                return None
+            if pieces and isinstance(pieces[0], list):
+                if len(pieces) != 1:
+                    return None
+                pieces = pieces[0]
+            if not all(isinstance(piece, int) for piece in pieces):
+                return None
+            input_ids.extend(pieces)
+            word_ids.extend([word_idx for _ in pieces])
+        if not input_ids:
+            return None
+
+        special_ids = self._add_target_special_tokens(input_ids)
+        offset = _find_subsequence(special_ids, input_ids)
+        if offset is None:
+            return None
+        aligned_word_ids: list[int | None] = [None for _ in special_ids]
+        for idx, word_idx in enumerate(word_ids):
+            aligned_word_ids[offset + idx] = word_idx
+
+        if truncation and len(special_ids) > self.max_target_length:
+            special_ids = special_ids[: self.max_target_length]
+            aligned_word_ids = aligned_word_ids[: self.max_target_length]
+        return {"input_ids": special_ids}, aligned_word_ids
+
+    def _add_target_special_tokens(self, input_ids: list[int]) -> list[int]:
+        build = getattr(self.tokenizer, "build_inputs_with_special_tokens", None)
+        if callable(build):
+            try:
+                return list(build(list(input_ids)))
+            except TypeError:
+                pass
+        prepared = self.tokenizer.prepare_for_model(
+            list(input_ids),
+            add_special_tokens=True,
+            truncation=False,
+            padding=False,
+        )
+        ids = prepared.get("input_ids") if isinstance(prepared, dict) else None
+        if not isinstance(ids, list):
+            return list(input_ids)
+        return list(ids)
 
     def _build_rfl_item_features(
         self,

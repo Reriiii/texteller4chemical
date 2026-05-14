@@ -782,6 +782,7 @@ class ChemSeq2SeqTrainer(Seq2SeqTrainer):
         self.eval_generation_metrics = eval_generation_metrics
         self.rfl_msd_loss = rfl_msd_loss
         self._rfl_split_warning_emitted = False
+        self._rfl_alignment_warning_emitted = False
         self.cuda_memory_log_steps = max(0, int(cuda_memory_log_steps))
         self.cuda_empty_cache_steps = max(0, int(cuda_empty_cache_steps))
         self._raw_training_step_count = 0
@@ -823,10 +824,17 @@ class ChemSeq2SeqTrainer(Seq2SeqTrainer):
                 "Build the dataset with scripts/create_rfl_target_dataset.py and set data.rfl_aux_field."
             )
         if not bool(alignment_ok.all().item()):
-            raise RuntimeError(
-                "At least one batch item could not align RFL word tokens to decoder label positions. "
-                "Use a tokenizer/vocabulary that preserves RFL tokens or inspect rfl_token_alignment_ok."
-            )
+            bad_items = int((~alignment_ok.bool()).sum().item())
+            if not self._rfl_alignment_warning_emitted and self.is_world_process_zero():
+                logger.warning(
+                    "RFL-MSD loss found %s batch item(s) whose RFL word tokens could not be aligned "
+                    "to decoder label positions. Sequence loss will still train them, but branch loss "
+                    "is masked for those items. Inspect rfl_token_alignment_ok if this warning persists.",
+                    bad_items,
+                )
+                self._rfl_alignment_warning_emitted = True
+            valid_alignment = alignment_ok.bool().view(-1, 1, 1).to(device=branch_mask.device)
+            branch_mask = branch_mask * valid_alignment.to(dtype=branch_mask.dtype)
         if (
             isinstance(split_token_count, torch.Tensor)
             and int(split_token_count.sum().item()) > 0
