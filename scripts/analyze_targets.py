@@ -21,15 +21,24 @@ from chemtexteller.utils import ensure_dir, save_json, setup_logging
 
 logger = setup_logging()
 
+ANGLE_VALUE = r"[-+]?\d+(?:\.\d+)?"
+LENGTH_VALUE = r"[-+]?\d+(?:\.\d+)?"
+BOND_GEOMETRY = rf"{ANGLE_VALUE}(?:,{LENGTH_VALUE})?"
+
 PATTERNS = {
     "chemfig": re.compile(r"\\chemfig"),
     "Chemabove": re.compile(r"\\Chemabove"),
-    "branch": re.compile(r"^branch$"),
+    "branch": re.compile(r"^branch(?:\(|\))?$"),
+    "branch_start": re.compile(r"^branch\($"),
+    "branch_end": re.compile(r"^branch\)$"),
     "reconnection_mark": re.compile(r"^\?\[[^\]]+\]$"),
-    "single_bond_angle": re.compile(r"^-\[:[-+]?\d+(?:\.\d+)?\]"),
-    "double_bond_angle": re.compile(r"^=\[:[-+]?\d+(?:\.\d+)?\]"),
-    "wedge_bond_angle": re.compile(r"^<\[:[-+]?\d+(?:\.\d+)?\]"),
-    "hashed_wedge_angle": re.compile(r"^<:\[:[-+]?\d+(?:\.\d+)?\]"),
+    "single_bond_angle": re.compile(rf"^-\[:{BOND_GEOMETRY}\]$"),
+    "aromatic_bond_angle": re.compile(rf"^-:\[:{BOND_GEOMETRY}\]$"),
+    "double_bond_angle": re.compile(rf"^=\[:{BOND_GEOMETRY}\]$"),
+    "triple_bond_angle": re.compile(rf"^~\[:{BOND_GEOMETRY}\]$"),
+    "wedge_bond_angle": re.compile(rf"^<\[:{BOND_GEOMETRY}\]$"),
+    "hashed_wedge_angle": re.compile(rf"^<:\[:{BOND_GEOMETRY}\]$"),
+    "any_bond_angle": re.compile(rf"^[<>=~:\-]*\[:{BOND_GEOMETRY}\]$"),
     "circle": re.compile(r"\\circle"),
 }
 
