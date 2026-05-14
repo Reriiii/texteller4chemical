@@ -263,6 +263,7 @@ def split_rows(args: argparse.Namespace, split: str) -> tuple[list[dict[str, Any
     changed_rows = 0
     bond_specs_seen = 0
     bond_specs_changed = 0
+    lengths_preserved_nonzero = 0
     fallback_computed_rows = 0
 
     for idx, row in enumerate(rows):
@@ -283,6 +284,7 @@ def split_rows(args: argparse.Namespace, split: str) -> tuple[list[dict[str, Any
         changed_rows += int(stats.changed)
         bond_specs_seen += stats.bond_specs_seen
         bond_specs_changed += stats.bond_specs_changed
+        lengths_preserved_nonzero += stats.lengths_preserved_nonzero
         graph_rows.append(
             {
                 "row_index": idx,
@@ -301,6 +303,7 @@ def split_rows(args: argparse.Namespace, split: str) -> tuple[list[dict[str, Any
         "changed_rows_pct": (100.0 * changed_rows / len(graph_rows)) if graph_rows else 0.0,
         "bond_specs_seen": bond_specs_seen,
         "bond_specs_changed": bond_specs_changed,
+        "lengths_preserved_nonzero": lengths_preserved_nonzero,
         "fallback_computed_rows": fallback_computed_rows,
     }
     return graph_rows, stats_dict

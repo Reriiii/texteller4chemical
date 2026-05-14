@@ -25,6 +25,7 @@ class GraphNormalizationStats:
     bond_specs_changed: int
     lengths_seen: int = 0
     lengths_dropped: int = 0
+    lengths_preserved_nonzero: int = 0
 
 
 def is_graph_norm_field(target_field: str) -> bool:
@@ -86,13 +87,15 @@ def normalize_ssml_graph_with_stats(
     changed = 0
     lengths_seen = 0
     lengths_dropped = 0
+    lengths_preserved_nonzero = 0
 
     def repl(match: re.Match[str]) -> str:
-        nonlocal seen, changed, lengths_seen, lengths_dropped
+        nonlocal seen, changed, lengths_seen, lengths_dropped, lengths_preserved_nonzero
         seen += 1
 
         angle = float(match.group("angle"))
         length = float(match.group("length"))
+        raw_length_text = match.group("length")
         lengths_seen += 1
 
         rounded_angle = (round(angle / angle_step) * angle_step) % 360.0
@@ -100,6 +103,12 @@ def normalize_ssml_graph_with_stats(
 
         angle_text = f"{rounded_angle:.{angle_decimals}f}"
         length_text = f"{rounded_length:.{length_decimals}f}"
+        if length > 0.0 and rounded_length == 0.0:
+            # A positive bond length rounded to zero can become a degenerate
+            # edge for GraphMatchingTool, so preserve the original nonzero
+            # geometry instead of turning it into 0.0.
+            length_text = raw_length_text
+            lengths_preserved_nonzero += 1
         should_drop_length = (
             drop_all_lengths
             or (
@@ -125,6 +134,7 @@ def normalize_ssml_graph_with_stats(
         bond_specs_changed=changed,
         lengths_seen=lengths_seen,
         lengths_dropped=lengths_dropped,
+        lengths_preserved_nonzero=lengths_preserved_nonzero,
     )
 
 

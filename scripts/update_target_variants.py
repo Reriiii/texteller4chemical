@@ -150,6 +150,7 @@ def split_summary(args: argparse.Namespace, split: str) -> dict[str, Any]:
             "bond_specs_changed": 0,
             "lengths_seen": 0,
             "lengths_dropped": 0,
+            "lengths_preserved_nonzero": 0,
             "token_lengths": [],
         }
         for field in args.fields
@@ -172,6 +173,7 @@ def split_summary(args: argparse.Namespace, split: str) -> dict[str, Any]:
             field_summary["bond_specs_changed"] += stats.bond_specs_changed
             field_summary["lengths_seen"] += stats.lengths_seen
             field_summary["lengths_dropped"] += stats.lengths_dropped
+            field_summary["lengths_preserved_nonzero"] += stats.lengths_preserved_nonzero
             field_summary["token_lengths"].append(len(whitespace_tokenize(normalized)))
 
             existing = targets.get(field)
