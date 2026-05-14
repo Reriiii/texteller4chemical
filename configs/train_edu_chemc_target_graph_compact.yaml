@@ -2,9 +2,9 @@ seed: 42
 max_target_length: 1024
 
 data:
-  target_key: targets.ssml_graph_norm
-  train_target_key: targets.ssml_graph_norm
-  eval_target_key: targets.ssml_graph_norm
+  target_key: targets.ssml_graph_compact
+  train_target_key: targets.ssml_graph_compact
+  eval_target_key: targets.ssml_graph_compact
   target_length_policy: filter
 
 image_size:

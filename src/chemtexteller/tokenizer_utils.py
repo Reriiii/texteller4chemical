@@ -30,16 +30,44 @@ def load_vocab_file(path: Path) -> list[str]:
     return tokens
 
 
+def target_from_metadata_row(
+    row: dict[str, Any],
+    target_key: str = "target",
+) -> str:
+    value: Any = row
+    if target_key.startswith("targets."):
+        value = row.get("targets", {})
+        target_key = target_key.split(".", 1)[1]
+
+    if "." not in target_key:
+        direct = row.get(target_key)
+        if isinstance(direct, str) and direct.strip():
+            return direct
+        raw_targets = row.get("targets")
+        if isinstance(raw_targets, dict):
+            nested = raw_targets.get(target_key)
+            if isinstance(nested, str) and nested.strip():
+                return nested
+
+    for part in target_key.split("."):
+        if not isinstance(value, dict) or part not in value:
+            raise KeyError(target_key)
+        value = value[part]
+    if not isinstance(value, str) or not value.strip():
+        raise KeyError(target_key)
+    return value
+
+
 def load_targets_from_metadata(metadata_path: Path, target_key: str = "target") -> list[str]:
     rows = read_jsonl(metadata_path)
     targets: list[str] = []
     for idx, row in enumerate(rows):
-        if target_key not in row:
-            raise KeyError(f"Missing key '{target_key}' in row {idx} of {metadata_path}")
-        target = row[target_key]
-        if not isinstance(target, str):
-            raise TypeError(f"Expected string target in row {idx}, got {type(target).__name__}")
-        targets.append(target)
+        try:
+            targets.append(target_from_metadata_row(row, target_key))
+        except KeyError as exc:
+            raise KeyError(
+                f"Missing non-empty target for key '{target_key}' in row {idx} of {metadata_path}"
+            ) from exc
     return targets
 
 

@@ -20,8 +20,10 @@ if str(SRC_DIR) not in sys.path:
 
 from chemtexteller.data import IMAGE_EXTENSIONS
 from chemtexteller.target_normalization import (
+    SSML_GRAPH_COMPACT_FIELD,
     SSML_GRAPH_NORM_FIELD,
     SSML_GRAPH_NORM_SOURCE_FIELD,
+    SSML_GRAPH_SD_FIELD,
     is_graph_norm_field,
     normalize_target_for_field,
 )
@@ -35,6 +37,8 @@ DEFAULT_TARGET_FIELDS = (
     "ssml_sd",
     "ssml_normed",
     SSML_GRAPH_NORM_FIELD,
+    SSML_GRAPH_SD_FIELD,
+    SSML_GRAPH_COMPACT_FIELD,
     "chemfig",
     "chemfg",
     "ssml_rcgd",
