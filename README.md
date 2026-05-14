@@ -17,7 +17,7 @@ handwritten chemical image -> pretrained TexTeller -> chemical markup sequence
 
 ## Configs
 
-Only two configs are kept:
+The stable configs are:
 
 ```text
 configs/train_edu_chemc.yaml
@@ -27,6 +27,16 @@ configs/train_edu_chemc_baseline.yaml
 `configs/train_edu_chemc.yaml` is the active experiment: `max_target_length: 1024`, TexTeller-aligned preprocessing, TexTeller OCR/Augraphy augmentation, full-model fine-tuning with encoder unfrozen, bf16, and length-balanced sampling.
 
 `configs/train_edu_chemc_baseline.yaml` preserves the earlier 20-epoch decoder-only LoRA r16 baseline for comparison.
+
+Additional config files in `configs/` are experiment snapshots. Treat
+`configs/train_edu_chemc.yaml` as the active default unless an experiment
+explicitly names a different file.
+
+## Research Pipeline Notes
+
+The graph-aware RFL branch is documented in
+`docs/TEXTELLER_RFL_PIPELINE.md`. It creates a separate RFL target dataset and
+does not mutate `data/processed/edu_chemc_graph_norm`.
 
 ## Setup
 
