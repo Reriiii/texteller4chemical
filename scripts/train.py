@@ -59,6 +59,7 @@ from chemtexteller.model_loader import (
     load_pretrained_model_and_tokenizer,
     resize_token_embeddings_if_needed,
 )
+from chemtexteller.rfl_msd_loss import RflMsdBranchClassifier, RflMsdLoss, sequence_cross_entropy
 from chemtexteller.transforms import build_transform
 from chemtexteller.utils import ensure_dir, load_yaml, save_json, save_yaml, set_seed, setup_logging
 
@@ -688,12 +689,89 @@ class EvalGenerationMetricRunner:
         self._graph_warning_emitted = True
 
 
+RFL_MSD_BATCH_KEYS = {
+    "rfl_branch_token_positions",
+    "rfl_bond_token_positions",
+    "rfl_branch_labels",
+    "rfl_branch_mask",
+    "rfl_token_alignment_ok",
+    "rfl_split_token_count",
+}
+
+
+def _nested_config_value(config: Any, *names: str) -> Any:
+    current = config
+    for name in names:
+        if current is None:
+            return None
+        current = getattr(current, name, None)
+    return current
+
+
+def infer_decoder_hidden_size(model: torch.nn.Module) -> int:
+    config = getattr(model, "config", None)
+    candidates = (
+        _nested_config_value(config, "decoder", "hidden_size"),
+        _nested_config_value(config, "decoder", "d_model"),
+        _nested_config_value(config, "text_config", "hidden_size"),
+        _nested_config_value(config, "text_config", "d_model"),
+        _nested_config_value(config, "decoder_hidden_size"),
+        _nested_config_value(config, "hidden_size"),
+        _nested_config_value(config, "d_model"),
+    )
+    for value in candidates:
+        if isinstance(value, int) and value > 0:
+            return value
+    raise SystemExit(
+        "RFL-MSD loss is enabled but decoder hidden size could not be inferred from model.config. "
+        "Set a model config with decoder.hidden_size/d_model or disable loss.type=rfl_msd."
+    )
+
+
+def _output_value(outputs: Any, name: str) -> Any:
+    if hasattr(outputs, name):
+        return getattr(outputs, name)
+    if isinstance(outputs, dict):
+        return outputs.get(name)
+    return None
+
+
+def decoder_last_hidden_state(outputs: Any) -> torch.Tensor:
+    hidden_states = _output_value(outputs, "decoder_hidden_states")
+    if hidden_states is None:
+        hidden_states = _output_value(outputs, "hidden_states")
+    if not hidden_states:
+        raise RuntimeError(
+            "RFL-MSD loss requires decoder hidden states, but the model did not return them. "
+            "The TexTeller model must support output_hidden_states=True for this mode."
+        )
+    last_hidden = hidden_states[-1]
+    if not isinstance(last_hidden, torch.Tensor) or last_hidden.ndim != 3:
+        raise RuntimeError(
+            "RFL-MSD loss expected decoder hidden state [B,L,D], "
+            f"got {type(last_hidden).__name__} with shape {getattr(last_hidden, 'shape', None)}."
+        )
+    return last_hidden
+
+
+def gather_token_states(hidden: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    if positions.ndim != 2:
+        raise ValueError(f"Expected positions [B,N], got {tuple(positions.shape)}")
+    if positions.shape[1] == 0:
+        return hidden.new_zeros((hidden.shape[0], 0, hidden.shape[-1]))
+    valid = positions >= 0
+    clamped = positions.clamp(min=0, max=max(0, hidden.shape[1] - 1))
+    gathered = hidden.gather(1, clamped.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
+    return gathered * valid.unsqueeze(-1).to(dtype=hidden.dtype)
+
+
 class ChemSeq2SeqTrainer(Seq2SeqTrainer):
     def __init__(
         self,
         *args: Any,
         length_balanced_sampling: dict[str, Any] | None = None,
         eval_generation_metrics: EvalGenerationMetricRunner | None = None,
+        rfl_msd_loss: RflMsdLoss | None = None,
         cuda_memory_log_steps: int = 0,
         cuda_empty_cache_steps: int = 0,
         **kwargs: Any,
@@ -702,9 +780,83 @@ class ChemSeq2SeqTrainer(Seq2SeqTrainer):
         self.length_balanced_sampling = length_balanced_sampling
         self._length_balanced_weights: torch.DoubleTensor | None = None
         self.eval_generation_metrics = eval_generation_metrics
+        self.rfl_msd_loss = rfl_msd_loss
+        self._rfl_split_warning_emitted = False
         self.cuda_memory_log_steps = max(0, int(cuda_memory_log_steps))
         self.cuda_empty_cache_steps = max(0, int(cuda_empty_cache_steps))
         self._raw_training_step_count = 0
+
+    def compute_loss(
+        self,
+        model: torch.nn.Module,
+        inputs: dict[str, Any],
+        return_outputs: bool = False,
+        **kwargs: Any,
+    ):
+        if self.rfl_msd_loss is None:
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+        rfl_inputs = {key: inputs.pop(key, None) for key in RFL_MSD_BATCH_KEYS}
+        labels = inputs.get("labels")
+        if not isinstance(labels, torch.Tensor):
+            raise RuntimeError("RFL-MSD loss requires labels in the training batch.")
+
+        inputs["output_hidden_states"] = True
+        inputs["return_dict"] = True
+        outputs = model(**inputs)
+        token_logits = _output_value(outputs, "logits")
+        if not isinstance(token_logits, torch.Tensor):
+            raise RuntimeError("RFL-MSD loss requires token logits from the model output.")
+
+        branch_positions = rfl_inputs["rfl_branch_token_positions"]
+        bond_positions = rfl_inputs["rfl_bond_token_positions"]
+        branch_labels = rfl_inputs["rfl_branch_labels"]
+        branch_mask = rfl_inputs["rfl_branch_mask"]
+        alignment_ok = rfl_inputs["rfl_token_alignment_ok"]
+        split_token_count = rfl_inputs["rfl_split_token_count"]
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (branch_positions, bond_positions, branch_labels, branch_mask, alignment_ok)
+        ):
+            raise RuntimeError(
+                "RFL-MSD loss is enabled, but the dataset batch does not contain RFL-MSD tensors. "
+                "Build the dataset with scripts/create_rfl_target_dataset.py and set data.rfl_aux_field."
+            )
+        if not bool(alignment_ok.all().item()):
+            raise RuntimeError(
+                "At least one batch item could not align RFL word tokens to decoder label positions. "
+                "Use a tokenizer/vocabulary that preserves RFL tokens or inspect rfl_token_alignment_ok."
+            )
+        if (
+            isinstance(split_token_count, torch.Tensor)
+            and int(split_token_count.sum().item()) > 0
+            and not self._rfl_split_warning_emitted
+            and self.is_world_process_zero()
+        ):
+            logger.warning(
+                "RFL-MSD loss is using the first subtoken hidden state for RFL words that the tokenizer "
+                "split into multiple pieces. For paper-faithful MSD training, extend/use a tokenizer that "
+                "keeps RFL tokens atomic."
+            )
+            self._rfl_split_warning_emitted = True
+
+        hidden = decoder_last_hidden_state(outputs)
+        branch_hidden = gather_token_states(hidden, branch_positions)
+        bond_hidden = gather_token_states(hidden, bond_positions)
+        branch_head = getattr(model, "rfl_msd_branch_classifier", None)
+        if not isinstance(branch_head, RflMsdBranchClassifier):
+            raise RuntimeError("Model is missing rfl_msd_branch_classifier.")
+        branch_logits = branch_head(branch_hidden, bond_hidden)
+        loss_output = self.rfl_msd_loss(
+            token_logits,
+            labels,
+            branch_logits=branch_logits,
+            branch_labels=branch_labels,
+            branch_mask=branch_mask,
+        )
+        if return_outputs:
+            return loss_output.loss, outputs
+        return loss_output.loss
 
     def evaluate(
         self,
@@ -884,6 +1036,31 @@ def validate_precision_config(training_cfg: dict[str, Any]) -> None:
             "training.bf16 is true, but this CUDA device does not support bf16. "
             "Use an Ampere-or-newer GPU, set training.fp16=true, or set training.bf16=false."
         )
+
+
+def build_rfl_msd_loss(config: dict[str, Any], model: torch.nn.Module) -> RflMsdLoss | None:
+    loss_cfg = config.get("loss", {})
+    if not isinstance(loss_cfg, dict) or str(loss_cfg.get("type", "seq2seq")).lower() != "rfl_msd":
+        return None
+    hidden_size = infer_decoder_hidden_size(model)
+    match_size = loss_cfg.get("branch_match_size")
+    branch_head = RflMsdBranchClassifier(
+        hidden_size=hidden_size,
+        match_size=int(match_size) if match_size is not None else None,
+    )
+    model.add_module("rfl_msd_branch_classifier", branch_head)
+    logger.info(
+        "Enabled RFL-MSD loss | hidden_size=%s lambda_sequence=%s lambda_branch=%s.",
+        hidden_size,
+        loss_cfg.get("lambda_sequence", 1.0),
+        loss_cfg.get("lambda_branch", 1.0),
+    )
+    return RflMsdLoss(
+        lambda_sequence=float(loss_cfg.get("lambda_sequence", 1.0)),
+        lambda_branch=float(loss_cfg.get("lambda_branch", 1.0)),
+        label_ignore_index=-100,
+        branch_ignore_index=-1,
+    )
 
 
 def save_model_with_assets(
@@ -1103,12 +1280,19 @@ def main() -> None:
 
     bundle.model = maybe_apply_lora(bundle.model, config, cli_enabled=args.use_lora)
     set_generation_cache(bundle.model, enabled=False)
+    rfl_msd_loss = build_rfl_msd_loss(config, bundle.model)
     log_trainable_parameter_summary(bundle.model)
 
     max_target_length = int(config.get("max_target_length", 512))
     length_policy = target_length_policy(config)
     train_target_key = data_target_key(config, "train")
     eval_target_key = data_target_key(config, "validation")
+    data_cfg = config.get("data", {})
+    rfl_aux_field = (
+        str(data_cfg.get("rfl_aux_field"))
+        if isinstance(data_cfg, dict) and data_cfg.get("rfl_aux_field")
+        else None
+    )
     train_transform = build_transform(config, train=True, processor=bundle.processor)
     eval_transform = build_transform(config, train=False, processor=bundle.processor)
     train_dataset = EduChemcDataset(
@@ -1118,6 +1302,7 @@ def main() -> None:
         max_target_length=max_target_length,
         target_key=train_target_key,
         target_length_policy=length_policy,
+        rfl_aux_field=rfl_aux_field,
     )
     eval_dataset = EduChemcDataset(
         split_dir=args.dataset_dir / "validation",
@@ -1126,6 +1311,7 @@ def main() -> None:
         max_target_length=max_target_length,
         target_key=eval_target_key,
         target_length_policy=length_policy,
+        rfl_aux_field=rfl_aux_field,
     )
     collator = VisionSeq2SeqCollator(bundle.tokenizer)
 
@@ -1145,6 +1331,7 @@ def main() -> None:
             output_dir=args.output_dir,
             cfg=config.get("eval_metrics", {}),
         ),
+        rfl_msd_loss=rfl_msd_loss,
         cuda_memory_log_steps=int(training_cfg.get("cuda_memory_log_steps", 0)),
         cuda_empty_cache_steps=int(training_cfg.get("cuda_empty_cache_steps", 0)),
         **trainer_kwargs_for_processing_class(bundle.tokenizer),

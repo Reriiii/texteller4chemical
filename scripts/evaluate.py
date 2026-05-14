@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import csv
 import contextlib
+import json
 import random
 from pathlib import Path
+from typing import Any, Sequence
 
 import torch
 from torch.utils.data import Subset
@@ -41,6 +43,18 @@ from chemtexteller.inference import (
 )
 from chemtexteller.metrics import per_sample_metrics, sequence_metrics
 from chemtexteller.model_loader import load_pretrained_model_and_tokenizer
+from chemtexteller.rfl_adapter import (
+    infer_rfl_bond_token_indices,
+    infer_rfl_branch_token_indices,
+    restore_rfl_text_to_chemfig,
+    split_rfl_text,
+)
+from chemtexteller.rfl_msd_loss import (
+    RflMsdBranchClassifier,
+    decoder_last_hidden_state,
+    gather_token_states,
+    infer_decoder_hidden_size,
+)
 from chemtexteller.target_normalization import SSML_GRAPH_NORM_FIELD, normalize_target_for_field
 from chemtexteller.transforms import build_transform
 from chemtexteller.utils import ensure_dir, save_json, setup_logging
@@ -58,6 +72,10 @@ TEMP_FIELDNAMES = [
     "raw_prediction",
     "first_pass_prediction",
     "prediction",
+    "graph_prediction",
+    "rfl_restore_status",
+    "rfl_branch_status",
+    "rfl_restore_error",
     "two_pass_used",
     "two_pass_reason",
     "two_pass_crops",
@@ -241,6 +259,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph_matching_tool_dir", type=Path, default=None)
     parser.add_argument("--graph_label_key", type=str, default=SSML_GRAPH_NORM_FIELD)
     parser.add_argument(
+        "--rfl_graph_restore",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Restore generated RFL-MSD tokens back to ChemFig before GraphMatchingTool. "
+            "Defaults to true when --graph_eval is used with a train config containing "
+            "loss.type=rfl_msd."
+        ),
+    )
+    parser.add_argument(
+        "--rfl_tool_dir",
+        type=Path,
+        default=Path("external/RFL-MSD"),
+        help="Path to the external RFL-MSD repository used for RFL -> ChemFig restore.",
+    )
+    parser.add_argument(
+        "--rfl_restore_strategy",
+        choices=["previous_bond", "none"],
+        default="previous_bond",
+        help=(
+            "Fallback branch-link strategy when a saved RFL-MSD branch head is not "
+            "available for generated RFL graph restore."
+        ),
+    )
+    parser.add_argument(
+        "--rfl_restore_use_branch_head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the saved RFL-MSD branch classifier head to infer branch links when present.",
+    )
+    parser.add_argument(
         "--prediction_normalizer",
         type=str,
         default=None,
@@ -314,6 +363,233 @@ def normalize_prediction(prediction: str, normalizer: str | None) -> str:
     return normalize_target_for_field(prediction, normalizer)
 
 
+def is_rfl_msd_config(config: dict[str, Any]) -> bool:
+    loss_cfg = config.get("loss", {})
+    return isinstance(loss_cfg, dict) and str(loss_cfg.get("type", "")).lower() == "rfl_msd"
+
+
+def should_restore_rfl_graph(args: argparse.Namespace, config: dict[str, Any]) -> bool:
+    if not args.graph_eval:
+        return False
+    if args.rfl_graph_restore is not None:
+        return bool(args.rfl_graph_restore)
+    return is_rfl_msd_config(config)
+
+
+def validate_rfl_restore_args(args: argparse.Namespace, enabled: bool) -> None:
+    if not enabled:
+        return
+    if not args.rfl_tool_dir.exists():
+        raise SystemExit(
+            f"--rfl_tool_dir is required for RFL graph restore and does not exist: {args.rfl_tool_dir}"
+        )
+
+
+def _candidate_checkpoint_weight_files(checkpoint_dir: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = checkpoint_dir / index_name
+        if not index_path.exists():
+            continue
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not read checkpoint weight index %s: %s", index_path, exc)
+            continue
+        weight_map = index.get("weight_map", {})
+        if isinstance(weight_map, dict):
+            files = {
+                checkpoint_dir / str(path)
+                for key, path in weight_map.items()
+                if "rfl_msd_branch_classifier." in str(key)
+            }
+            candidates.extend(sorted(files))
+    for name in ("model.safetensors", "adapter_model.safetensors", "pytorch_model.bin"):
+        path = checkpoint_dir / name
+        if path.exists():
+            candidates.append(path)
+    candidates.extend(sorted(checkpoint_dir.glob("*.safetensors")))
+    candidates.extend(sorted(checkpoint_dir.glob("pytorch_model*.bin")))
+    candidates.extend(sorted(checkpoint_dir.glob("adapter_model*.bin")))
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen or not path.exists():
+            continue
+        unique.append(path)
+        seen.add(resolved)
+    return unique
+
+
+def _load_rfl_branch_head_state(checkpoint_dir: Path) -> dict[str, torch.Tensor]:
+    marker = "rfl_msd_branch_classifier."
+    state: dict[str, torch.Tensor] = {}
+    for path in _candidate_checkpoint_weight_files(checkpoint_dir):
+        if path.suffix == ".safetensors":
+            try:
+                from safetensors import safe_open
+            except ImportError:
+                logger.warning("safetensors is unavailable; cannot inspect %s", path)
+                continue
+            try:
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        if marker in key:
+                            state[key.split(marker, 1)[1]] = f.get_tensor(key)
+            except Exception as exc:
+                logger.warning("Could not read RFL-MSD branch-head tensors from %s: %s", path, exc)
+            continue
+        try:
+            loaded = torch.load(path, map_location="cpu")
+        except Exception as exc:
+            logger.warning("Could not inspect %s for RFL-MSD branch-head tensors: %s", path, exc)
+            continue
+        if isinstance(loaded, dict) and "state_dict" in loaded and isinstance(loaded["state_dict"], dict):
+            loaded = loaded["state_dict"]
+        if not isinstance(loaded, dict):
+            continue
+        for key, value in loaded.items():
+            clean_key = str(key)
+            if clean_key.startswith("module."):
+                clean_key = clean_key[len("module.") :]
+            if marker in clean_key and isinstance(value, torch.Tensor):
+                state[clean_key.split(marker, 1)[1]] = value.detach().cpu()
+        if state:
+            break
+    return state
+
+
+def attach_rfl_msd_branch_head(
+    model: torch.nn.Module,
+    checkpoint_dir: Path,
+    config: dict[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype | None,
+) -> bool:
+    if not is_rfl_msd_config(config):
+        return False
+    if isinstance(getattr(model, "rfl_msd_branch_classifier", None), RflMsdBranchClassifier):
+        return True
+    try:
+        hidden_size = infer_decoder_hidden_size(model)
+    except ValueError as exc:
+        logger.warning("Cannot attach RFL-MSD branch head: %s", exc)
+        return False
+    loss_cfg = config.get("loss", {})
+    match_size = loss_cfg.get("branch_match_size") if isinstance(loss_cfg, dict) else None
+    branch_head = RflMsdBranchClassifier(
+        hidden_size=hidden_size,
+        match_size=int(match_size) if match_size is not None else None,
+    )
+    state = _load_rfl_branch_head_state(checkpoint_dir)
+    if state:
+        missing, unexpected = branch_head.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            logger.warning(
+                "Loaded RFL-MSD branch head with missing=%s unexpected=%s.",
+                list(missing),
+                list(unexpected),
+            )
+        else:
+            logger.info("Loaded RFL-MSD branch head from %s.", checkpoint_dir)
+    else:
+        logger.warning(
+            "RFL-MSD config is active but no saved rfl_msd_branch_classifier weights "
+            "were found in %s; graph restore will fall back to %s.",
+            checkpoint_dir,
+            "sequence heuristics",
+        )
+        return False
+    branch_head.to(device=device, dtype=dtype)
+    model.add_module("rfl_msd_branch_classifier", branch_head)
+    return True
+
+
+def _first_subtoken_positions(tokenizer: Any, tokens: Sequence[str]) -> tuple[torch.Tensor, str]:
+    encoded = tokenizer(
+        list(tokens),
+        is_split_into_words=True,
+        add_special_tokens=True,
+        return_tensors="pt",
+    )
+    word_ids = encoded.word_ids(0) if hasattr(encoded, "word_ids") else []
+    word_to_position: dict[int, int] = {}
+    for position, word_id in enumerate(word_ids):
+        if word_id is None or int(word_id) in word_to_position:
+            continue
+        word_to_position[int(word_id)] = position
+    if len(word_to_position) != len(tokens):
+        return encoded["input_ids"], "token_alignment_failed"
+    positions = [word_to_position[idx] for idx in range(len(tokens))]
+    return encoded["input_ids"], "ok:" + ",".join(str(pos) for pos in positions)
+
+
+def infer_rfl_branch_pairs_from_head(
+    *,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    pixel_values: torch.Tensor,
+    prediction: str,
+    device: torch.device,
+) -> tuple[list[tuple[int, int]], str]:
+    branch_head = getattr(model, "rfl_msd_branch_classifier", None)
+    if not isinstance(branch_head, RflMsdBranchClassifier):
+        return [], "no_branch_head"
+    tokens = split_rfl_text(prediction)
+    branch_indices = infer_rfl_branch_token_indices(tokens)
+    bond_indices = infer_rfl_bond_token_indices(tokens)
+    if not branch_indices:
+        return [], "no_connbranch"
+    if not bond_indices:
+        return [], "no_bond_tokens"
+    try:
+        input_ids, alignment = _first_subtoken_positions(tokenizer, tokens)
+    except Exception as exc:
+        return [], f"token_alignment_failed:{exc}"
+    if not alignment.startswith("ok:"):
+        return [], alignment
+    positions = [int(item) for item in alignment[3:].split(",") if item]
+    branch_positions = torch.tensor(
+        [[positions[idx] for idx in branch_indices]],
+        device=device,
+        dtype=torch.long,
+    )
+    bond_positions = torch.tensor(
+        [[positions[idx] for idx in bond_indices]],
+        device=device,
+        dtype=torch.long,
+    )
+    try:
+        outputs = model(
+            pixel_values=pixel_values,
+            labels=input_ids.to(device),
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden = decoder_last_hidden_state(outputs)
+        branch_hidden = gather_token_states(hidden, branch_positions)
+        bond_hidden = gather_token_states(hidden, bond_positions)
+        logits = branch_head(branch_hidden, bond_hidden)
+        probabilities = torch.softmax(logits, dim=-1)[0, :, :, 1]
+    except Exception as exc:
+        return [], f"branch_head_failed:{exc}"
+    pairs: list[tuple[int, int]] = []
+    for row_idx, branch_token_idx in enumerate(branch_indices):
+        prior_candidates = [
+            col_idx
+            for col_idx, bond_token_idx in enumerate(bond_indices)
+            if bond_token_idx < branch_token_idx
+        ]
+        if not prior_candidates:
+            continue
+        candidate_scores = probabilities[row_idx, prior_candidates]
+        best_col = prior_candidates[int(torch.argmax(candidate_scores).item())]
+        pairs.append((branch_token_idx, bond_indices[best_col]))
+    return pairs, f"branch_head:{len(pairs)}"
+
+
 def log_inference_preprocessing(config: dict[str, object]) -> None:
     image_cfg = config.get("image_size", {})
     if not isinstance(image_cfg, dict):
@@ -384,6 +660,8 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     config = load_inference_config(args.model_ckpt, args.config, args.max_new_tokens)
+    rfl_graph_restore = should_restore_rfl_graph(args, config)
+    validate_rfl_restore_args(args, rfl_graph_restore)
     log_inference_preprocessing(config)
     target_key = resolve_eval_target_key(config, args.target_key)
     bundle = load_pretrained_model_and_tokenizer(
@@ -399,6 +677,22 @@ def main() -> None:
         logger.info("Using %s inference for generation.", inference_dtype)
     else:
         bundle.model.to(device)
+    rfl_branch_head_loaded = False
+    if rfl_graph_restore and args.rfl_restore_use_branch_head:
+        rfl_branch_head_loaded = attach_rfl_msd_branch_head(
+            bundle.model,
+            args.model_ckpt,
+            config,
+            device=device,
+            dtype=inference_dtype,
+        )
+    if rfl_graph_restore:
+        logger.info(
+            "RFL graph restore enabled | rfl_tool_dir=%s branch_head=%s fallback_strategy=%s.",
+            args.rfl_tool_dir,
+            rfl_branch_head_loaded,
+            args.rfl_restore_strategy,
+        )
     bundle.model.eval()
     set_generation_cache(bundle.model, enabled=True)
 
@@ -481,13 +775,22 @@ def main() -> None:
             decoded = bundle.tokenizer.batch_decode(generated, skip_special_tokens=True)
             start = batch_idx * args.batch_size
             batch_sample_indices = process_indices[start : start + len(decoded)]
-            for sample_index, image_name, image_path, metadata_targets, ref, pred in zip(
-                batch_sample_indices,
-                batch["image_names"],
-                batch["image_paths"],
-                batch["metadata_targets"],
-                batch["targets"],
-                decoded,
+            for sample_offset, (
+                sample_index,
+                image_name,
+                image_path,
+                metadata_targets,
+                ref,
+                pred,
+            ) in enumerate(
+                zip(
+                    batch_sample_indices,
+                    batch["image_names"],
+                    batch["image_paths"],
+                    batch["metadata_targets"],
+                    batch["targets"],
+                    decoded,
+                )
             ):
                 first_pass_prediction = pred
                 component_predictions = ""
@@ -519,6 +822,36 @@ def main() -> None:
                         for text in two_pass.component_predictions
                     )
                 normalized_pred = normalize_prediction(pred, args.prediction_normalizer)
+                graph_prediction = normalized_pred
+                rfl_restore_status = ""
+                rfl_branch_status = ""
+                rfl_restore_error = ""
+                if rfl_graph_restore:
+                    branch_pairs: list[tuple[int, int]] | None = None
+                    if rfl_branch_head_loaded:
+                        inferred_pairs, rfl_branch_status = infer_rfl_branch_pairs_from_head(
+                            model=bundle.model,
+                            tokenizer=bundle.tokenizer,
+                            pixel_values=pixel_values[sample_offset : sample_offset + 1],
+                            prediction=pred,
+                            device=device,
+                        )
+                        if rfl_branch_status.startswith("branch_head:") and inferred_pairs:
+                            branch_pairs = inferred_pairs
+                    restore = restore_rfl_text_to_chemfig(
+                        pred,
+                        args.rfl_tool_dir,
+                        branch_pairs=branch_pairs,
+                        branch_strategy=args.rfl_restore_strategy,
+                    )
+                    rfl_restore_status = "ok" if restore.success else "failed"
+                    rfl_restore_error = restore.error or ""
+                    if not rfl_branch_status:
+                        rfl_branch_status = f"{restore.strategy}:{len(restore.branch_pairs)}"
+                    graph_prediction = normalize_prediction(
+                        restore.chemfig,
+                        args.prediction_normalizer,
+                    )
                 graph_label = ""
                 if args.graph_eval:
                     graph_label = lookup_target(metadata_targets, args.graph_label_key)
@@ -533,6 +866,10 @@ def main() -> None:
                         "raw_prediction": pred,
                         "first_pass_prediction": first_pass_prediction,
                         "prediction": normalized_pred,
+                        "graph_prediction": graph_prediction,
+                        "rfl_restore_status": rfl_restore_status,
+                        "rfl_branch_status": rfl_branch_status,
+                        "rfl_restore_error": rfl_restore_error,
                         "two_pass_used": two_pass_used,
                         "two_pass_reason": two_pass_reason,
                         "two_pass_crops": two_pass_crops,
@@ -574,7 +911,14 @@ def main() -> None:
             args.output_csv,
             args.graph_output_txt,
         )
-        write_graph_matching_files(rows, rec_path, lab_path)
+        graph_rows = [
+            {
+                **row,
+                "prediction": row.get("graph_prediction") or row.get("prediction", ""),
+            }
+            for row in rows
+        ]
+        write_graph_matching_files(graph_rows, rec_path, lab_path)
         graph_result = run_graph_matching_tool(
             tool_dir=args.graph_matching_tool_dir,
             rec_path=rec_path,
@@ -588,8 +932,15 @@ def main() -> None:
                 "graph_matching_tool_dir": str(args.graph_matching_tool_dir),
                 "graph_label_key": args.graph_label_key,
                 "graph_output_txt": str(graph_result.output_path),
+                "graph_prediction_field": "graph_prediction",
             }
         )
+        if rfl_graph_restore:
+            restore_statuses = [str(row.get("rfl_restore_status", "")) for row in rows]
+            metrics["rfl_graph_restore"] = True
+            metrics["rfl_restore_ok"] = sum(status == "ok" for status in restore_statuses)
+            metrics["rfl_restore_failed"] = sum(status == "failed" for status in restore_statuses)
+            metrics["rfl_branch_head_loaded"] = bool(rfl_branch_head_loaded)
         logger.info(
             "Graph matching metrics: EM=%.6f, Structure EM=%.6f",
             metrics["graph_em"],

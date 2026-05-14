@@ -14,7 +14,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from chemtexteller.rfl_adapter import convert_ssml_to_rfl  # noqa: E402
+from chemtexteller.rfl_adapter import convert_ssml_to_rfl, restore_rfl_text_to_chemfig  # noqa: E402
 from chemtexteller.utils import ensure_dir, read_jsonl, save_json, setup_logging, write_jsonl  # noqa: E402
 
 
@@ -28,8 +28,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_dir", type=Path, required=True)
     parser.add_argument("--out_dir", type=Path, required=True)
     parser.add_argument("--splits", nargs="+", default=["train", "validation", "test"])
-    parser.add_argument("--source_key", type=str, default="ssml_sd")
+    parser.add_argument("--source_key", type=str, default="ssml_normed")
     parser.add_argument("--target_field", type=str, default="ssml_rfl")
+    parser.add_argument(
+        "--graph_label_field",
+        type=str,
+        default="ssml_rfl_graph_norm",
+        help=(
+            "Extra target field containing ChemFig restored from the ground-truth RFL "
+            "sequence using exact MSD branch pairs. Use this field as the RFL graph-eval label."
+        ),
+    )
     parser.add_argument("--rfl_tool_dir", type=Path, default=Path("external/RFL-MSD"))
     parser.add_argument(
         "--aux_field",
@@ -115,6 +124,69 @@ def validate_rfl_result(result: Any) -> str | None:
     return None
 
 
+def is_bond_token(token: str) -> bool:
+    return ("[:" in token and token.endswith("]")) or (
+        token.startswith("?[") and token.endswith("]") and "," in token
+    )
+
+
+def build_msd_auxiliary(result: Any) -> dict[str, Any]:
+    tokens = list(result.tokens)
+    bond_token_indices = [idx for idx, token in enumerate(tokens) if is_bond_token(token)]
+    bond_index_by_token = {token_idx: bond_idx for bond_idx, token_idx in enumerate(bond_token_indices)}
+    branch_token_indices: list[int] = []
+    branch_connection_pairs: list[list[int]] = []
+    skipped_connections: list[dict[str, Any]] = []
+
+    ring_branch_info = result.ring_branch_info
+    if isinstance(ring_branch_info, list):
+        for token_idx, connections in enumerate(ring_branch_info):
+            if not isinstance(connections, list) or not connections:
+                continue
+            branch_idx = len(branch_token_indices)
+            branch_token_indices.append(token_idx)
+            for connected_token_idx in connections:
+                if not isinstance(connected_token_idx, int):
+                    skipped_connections.append(
+                        {
+                            "branch_token_index": token_idx,
+                            "connected_token_index": connected_token_idx,
+                            "reason": "non_integer_connection",
+                        }
+                    )
+                    continue
+                bond_idx = bond_index_by_token.get(connected_token_idx)
+                if bond_idx is None:
+                    skipped_connections.append(
+                        {
+                            "branch_token_index": token_idx,
+                            "connected_token_index": connected_token_idx,
+                            "reason": "connection_token_is_not_a_bond",
+                        }
+                    )
+                    continue
+                branch_connection_pairs.append([branch_idx, bond_idx])
+
+    return {
+        "bond_token_indices": bond_token_indices,
+        "branch_token_indices": branch_token_indices,
+        "branch_connection_pairs": branch_connection_pairs,
+        "branch_label_shape": [len(branch_token_indices), len(bond_token_indices)],
+        "skipped_connections": skipped_connections,
+    }
+
+
+def msd_connection_token_pairs(msd_aux: dict[str, Any]) -> list[tuple[int, int]]:
+    branch_token_indices = list(msd_aux.get("branch_token_indices") or [])
+    bond_token_indices = list(msd_aux.get("bond_token_indices") or [])
+    pairs: list[tuple[int, int]] = []
+    for branch_idx, bond_idx in msd_aux.get("branch_connection_pairs") or []:
+        if branch_idx >= len(branch_token_indices) or bond_idx >= len(bond_token_indices):
+            continue
+        pairs.append((int(branch_token_indices[branch_idx]), int(bond_token_indices[bond_idx])))
+    return pairs
+
+
 def build_auxiliary_metadata(
     args: argparse.Namespace,
     source_key: str,
@@ -130,6 +202,7 @@ def build_auxiliary_metadata(
         "ring_branch_info": result.ring_branch_info,
         "cond_data": result.cond_data,
         "ring_count": result.ring_count,
+        "msd": build_msd_auxiliary(result),
     }
 
 
@@ -148,6 +221,10 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
     ring_counts: list[int] = []
     missing_ea_count = 0
     converted_count = 0
+    branch_connection_counts: list[int] = []
+    branch_candidate_counts: list[int] = []
+    bond_candidate_counts: list[int] = []
+    graph_label_count = 0
     source_target_name = target_name(args.source_key)
 
     for idx, row in enumerate(tqdm(rows, desc=f"RFL {split}")):
@@ -169,6 +246,25 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
                 ring_counts.append(result.ring_count)
             if "<ea>" not in result.tokens:
                 missing_ea_count += 1
+            msd_aux = build_msd_auxiliary(result)
+            branch_connection_counts.append(len(msd_aux["branch_connection_pairs"]))
+            branch_candidate_counts.append(len(msd_aux["branch_token_indices"]))
+            bond_candidate_counts.append(len(msd_aux["bond_token_indices"]))
+            graph_label = None
+            if args.graph_label_field:
+                restore = restore_rfl_text_to_chemfig(
+                    target,
+                    args.rfl_tool_dir,
+                    branch_pairs=msd_connection_token_pairs(msd_aux),
+                    cond_data=result.cond_data,
+                )
+                if not restore.success:
+                    raise RuntimeError(
+                        f"RFL graph-label restore failed for {split} row {idx} "
+                        f"({image_name}): {restore.error}"
+                    )
+                graph_label = restore.chemfig
+                graph_label_count += 1
         else:
             failures.append(
                 {
@@ -190,10 +286,14 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
             target = source
             status = "fallback"
             fallback_count += 1
+            msd_aux = {}
+            graph_label = None
 
         targets = dict(row.get("targets") or {})
         targets[source_target_name] = source
         targets[args.target_field] = target
+        if graph_label is not None:
+            targets[args.graph_label_field] = graph_label
         out_row = dict(row)
         out_row["file_name"] = resolve_image_path(in_split_dir, row)
         out_row["image_name"] = image_name
@@ -225,6 +325,12 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
         "ring_count_max": max(ring_counts) if ring_counts else 0,
         "ring_sample_count": sum(1 for count in ring_counts if count > 0),
         "missing_ea_count": missing_ea_count,
+        "branch_connection_total": sum(branch_connection_counts),
+        "branch_connection_rows": sum(1 for count in branch_connection_counts if count > 0),
+        "branch_candidate_max": max(branch_candidate_counts) if branch_candidate_counts else 0,
+        "bond_candidate_max": max(bond_candidate_counts) if bond_candidate_counts else 0,
+        "graph_label_field": args.graph_label_field,
+        "graph_label_count": graph_label_count,
         "failures": failures,
     }
 
@@ -254,6 +360,7 @@ def main() -> None:
         "out_dir": str(args.out_dir),
         "source_key": args.source_key,
         "target_field": args.target_field,
+        "graph_label_field": args.graph_label_field,
         "aux_field": None if args.no_auxiliary else args.aux_field,
         "need_ring_count": args.need_ring_count,
         "rfl_tool_dir": str(args.rfl_tool_dir),

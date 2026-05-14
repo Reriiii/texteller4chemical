@@ -14,12 +14,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_ID = "ConstantHao/EDU-CHEMC_MM23"
 DEFAULT_TARGET_FIELD = "ssml_graph_norm"
 DEFAULT_DATASET_DIR = Path("data/processed/edu_chemc_graph_norm")
+DEFAULT_RFL_DATASET_DIR = Path("data/processed/edu_chemc_rfl_msd")
 DEFAULT_OUTPUT_DIR = Path(
     "outputs/runs/edu_chemc_texteller_graph_norm_full_model_bf16_30ep"
 )
+DEFAULT_RFL_OUTPUT_DIR = Path(
+    "outputs/runs/edu_chemc_texteller_rfl_msd_full_model_bf16_30ep"
+)
 DEFAULT_EVAL_CSV = Path("outputs/eval_graph_norm_full_model_bf16_30ep_test_greedy.csv")
-STAGE_ORDER = ("download", "prepare", "analyze", "train", "evaluate")
-STAGE_ALIASES = ("all", "train_eval")
+DEFAULT_RFL_EVAL_CSV = Path("outputs/eval_rfl_msd_full_model_bf16_30ep_test_greedy.csv")
+DEFAULT_RFL_GRAPH_LABEL_FIELD = "ssml_rfl_graph_norm"
+BASE_STAGE_ORDER = ("download", "prepare", "analyze", "train", "evaluate")
+STAGE_ORDER = ("download", "prepare", "rfl_prepare", "rfl_check", "analyze", "train", "evaluate")
+STAGE_ALIASES = ("all", "train_eval", "rfl_msd", "rfl_msd_prepare", "rfl_msd_train_eval")
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +49,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache_dir", type=Path, default=None)
     parser.add_argument("--dataset_dir", type=Path, default=DEFAULT_DATASET_DIR)
     parser.add_argument("--target_field", type=str, default=DEFAULT_TARGET_FIELD)
+    parser.add_argument(
+        "--use_rfl_msd",
+        action="store_true",
+        help="Use the RFL-MSD prepared dataset/config for analyze/train/evaluate stages.",
+    )
+    parser.add_argument("--rfl_dataset_dir", type=Path, default=DEFAULT_RFL_DATASET_DIR)
+    parser.add_argument("--rfl_source_key", type=str, default="ssml_normed")
+    parser.add_argument("--rfl_target_field", type=str, default="ssml_rfl")
+    parser.add_argument("--rfl_graph_label_field", type=str, default=DEFAULT_RFL_GRAPH_LABEL_FIELD)
+    parser.add_argument("--rfl_aux_field", type=str, default="rfl")
+    parser.add_argument("--rfl_tool_dir", type=Path, default=Path("external/RFL-MSD"))
+    parser.add_argument("--rfl_on_error", choices=["raise", "skip", "fallback"], default="raise")
+    parser.add_argument("--overwrite_rfl_prepare", action="store_true")
     parser.add_argument("--max_samples_per_split", type=int, default=None)
     parser.add_argument("--overwrite_prepare", action="store_true")
     parser.add_argument("--config", type=Path, default=Path("configs/train_edu_chemc.yaml"))
@@ -99,11 +119,21 @@ def parse_args() -> argparse.Namespace:
 
 def selected_stages(values: list[str]) -> list[str]:
     if "all" in values:
-        return list(STAGE_ORDER)
+        return list(BASE_STAGE_ORDER)
+    if "rfl_msd" in values:
+        values = [*values, "prepare", "rfl_prepare", "rfl_check", "analyze", "train", "evaluate"]
+    if "rfl_msd_prepare" in values:
+        values = [*values, "prepare", "rfl_prepare", "rfl_check"]
+    if "rfl_msd_train_eval" in values:
+        values = [*values, "rfl_check", "train", "evaluate"]
     if "train_eval" in values:
         values = [*values, "train", "evaluate"]
     requested = set(values)
     return [stage for stage in STAGE_ORDER if stage in requested]
+
+
+def active_dataset_dir(args: argparse.Namespace) -> Path:
+    return args.rfl_dataset_dir if args.use_rfl_msd else args.dataset_dir
 
 
 def display_cmd(cmd: list[str]) -> str:
@@ -233,7 +263,7 @@ def prepare_command(args: argparse.Namespace) -> list[str]:
 
 
 def analyze_commands(args: argparse.Namespace) -> list[list[str]]:
-    metadata = args.dataset_dir / "train" / "metadata.jsonl"
+    metadata = active_dataset_dir(args) / "train" / "metadata.jsonl"
     return [
         [
             sys.executable,
@@ -251,6 +281,50 @@ def analyze_commands(args: argparse.Namespace) -> list[list[str]]:
             "--max_decoder_length",
             str(args.max_new_tokens),
         ],
+    ]
+
+
+def rfl_prepare_command(args: argparse.Namespace) -> list[str]:
+    cmd = [
+        sys.executable,
+        "scripts/create_rfl_target_dataset.py",
+        "--dataset_dir",
+        str(args.dataset_dir),
+        "--out_dir",
+        str(args.rfl_dataset_dir),
+        "--source_key",
+        args.rfl_source_key,
+        "--target_field",
+        args.rfl_target_field,
+        "--graph_label_field",
+        args.rfl_graph_label_field,
+        "--aux_field",
+        args.rfl_aux_field,
+        "--rfl_tool_dir",
+        str(args.rfl_tool_dir),
+        "--on_error",
+        args.rfl_on_error,
+    ]
+    if args.max_samples_per_split is not None:
+        cmd.extend(["--max_samples_per_split", str(args.max_samples_per_split)])
+    if args.overwrite_rfl_prepare:
+        cmd.append("--overwrite")
+    return cmd
+
+
+def rfl_check_command(args: argparse.Namespace) -> list[str]:
+    return [
+        sys.executable,
+        "scripts/check_rfl_msd_loss_readiness.py",
+        "--config",
+        str(args.config),
+        "--dataset_dir",
+        str(args.rfl_dataset_dir),
+        "--rfl_aux_field",
+        args.rfl_aux_field,
+        "--graph_label_key",
+        args.rfl_graph_label_field,
+        "--assume_rfl_decoder",
     ]
 
 
@@ -283,7 +357,7 @@ def train_command(args: argparse.Namespace) -> list[str]:
             "--config",
             str(args.config),
             "--dataset_dir",
-            str(args.dataset_dir),
+            str(active_dataset_dir(args)),
             "--pretrained_model_name_or_path",
             args.pretrained_model_name_or_path,
             "--output_dir",
@@ -306,7 +380,9 @@ def evaluate_command(args: argparse.Namespace) -> list[str]:
         "--model_ckpt",
         str(args.output_dir / "best"),
         "--dataset_dir",
-        str(args.dataset_dir),
+        str(active_dataset_dir(args)),
+        "--config",
+        str(args.config),
         "--split",
         args.eval_split,
         "--batch_size",
@@ -320,7 +396,7 @@ def evaluate_command(args: argparse.Namespace) -> list[str]:
         "--output_csv",
         str(args.eval_output_csv),
         "--graph_label_key",
-        args.graph_label_key or args.target_field,
+        args.graph_label_key or (args.rfl_graph_label_field if args.use_rfl_msd else args.target_field),
     ]
     if args.eval_target_key:
         cmd.extend(["--target_key", args.eval_target_key])
@@ -342,6 +418,14 @@ def evaluate_command(args: argparse.Namespace) -> list[str]:
                 str(args.graph_num_workers),
             ]
         )
+        if args.use_rfl_msd:
+            cmd.extend(
+                [
+                    "--rfl_graph_restore",
+                    "--rfl_tool_dir",
+                    str(args.rfl_tool_dir),
+                ]
+            )
         if args.graph_keep_temp:
             cmd.append("--graph_keep_temp")
     return cmd
@@ -349,6 +433,16 @@ def evaluate_command(args: argparse.Namespace) -> list[str]:
 
 def main() -> None:
     args = parse_args()
+    if any(stage.startswith("rfl_") for stage in args.stages) or any(
+        stage in {"rfl_msd", "rfl_msd_prepare", "rfl_msd_train_eval"} for stage in args.stages
+    ):
+        args.use_rfl_msd = True
+    if args.use_rfl_msd and args.config == Path("configs/train_edu_chemc.yaml"):
+        args.config = Path("configs/train_edu_chemc_rfl_msd.yaml")
+    if args.use_rfl_msd and args.output_dir == DEFAULT_OUTPUT_DIR:
+        args.output_dir = DEFAULT_RFL_OUTPUT_DIR
+    if args.use_rfl_msd and args.eval_output_csv == DEFAULT_EVAL_CSV:
+        args.eval_output_csv = DEFAULT_RFL_EVAL_CSV
     stages = selected_stages(args.stages)
     if (
         "train" in stages
@@ -368,6 +462,10 @@ def main() -> None:
             download_dataset(args)
         elif stage == "prepare":
             run_command(prepare_command(args), dry_run=args.dry_run, args=args)
+        elif stage == "rfl_prepare":
+            run_command(rfl_prepare_command(args), dry_run=args.dry_run, args=args)
+        elif stage == "rfl_check":
+            run_command(rfl_check_command(args), dry_run=args.dry_run, args=args)
         elif stage == "analyze":
             for cmd in analyze_commands(args):
                 run_command(cmd, dry_run=args.dry_run, args=args)
