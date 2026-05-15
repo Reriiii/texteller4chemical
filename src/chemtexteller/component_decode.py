@@ -13,7 +13,16 @@ from .inference import generate_from_pixel_values, move_pixel_values
 
 
 TOKEN_RE = re.compile(
-    r"\\[A-Za-z]+|\?\[[^\]]+\]|[-=~<>|_:]*\[:\s*-?\d+\]|[A-Za-z]+|\d+|[^\s]"
+    r"branch\(|branch\)|\\[A-Za-z]+|\?\[[^\]]+\]"
+    r"|[-=~<>|_:]*\[:\s*-?\d+(?:\.\d+)?,\s*\d+(?:\.\d+)?\]"
+    r"|[A-Za-z]+|\d+|[^\s]"
+)
+REACTION_MARKERS = (
+    r"\rightarrow",
+    r"\xrightarrow",
+    r"\xrightleftharpoons",
+    r"\rightleftharpoons",
+    " + ",
 )
 
 
@@ -24,11 +33,20 @@ class TwoPassDecodeConfig:
     overlap_ratio: float = 0.20
     max_crops: int = 5
     min_crop_width: int = 128
+    split_strategy: str = "ink_or_windows"
+    min_gap_width: int = 10
+    gap_ink_fraction: float = 0.01
+    component_padding: int = 6
+    min_component_width: int = 48
     crop_max_new_tokens: int | None = 512
     selection: str = "syntax_strict"
     min_length_gain_tokens: int = 20
     min_length_ratio: float = 0.70
     max_length_ratio: float = 1.25
+    min_first_pass_tokens: int = 96
+    trigger_reaction_markers: bool = True
+    trigger_multi_chemfig: bool = True
+    min_chemfig_count: int = 2
     trim_threshold: int = 15
 
 
@@ -90,7 +108,7 @@ def syntax_stats(text: str) -> SyntaxStats:
     brace_delta = text.count("{") - text.count("}")
     paren_delta = text.count("(") - text.count(")")
     chemfig_count = text.count(r"\chemfig")
-    branch_count = tokens.count("branch")
+    branch_count = tokens.count("branch") + tokens.count("branch(")
     unk_count = text.count(r"\unk")
     score = 0.0
     score -= 20.0 * abs(brace_delta)
@@ -139,6 +157,12 @@ def _trigger_reasons(
     reasons: list[str] = []
     if aspect_ratio >= cfg.min_aspect_ratio:
         reasons.append(f"wide_image_aspect={aspect_ratio:.2f}")
+    if cfg.min_first_pass_tokens > 0 and stats.token_count >= cfg.min_first_pass_tokens:
+        reasons.append(f"long_first_pass_tokens={stats.token_count}")
+    if cfg.trigger_multi_chemfig and stats.chemfig_count >= cfg.min_chemfig_count:
+        reasons.append(f"multi_chemfig={stats.chemfig_count}")
+    if cfg.trigger_reaction_markers and any(marker in first_pass_prediction for marker in REACTION_MARKERS):
+        reasons.append("reaction_marker")
     if stats.brace_delta != 0:
         reasons.append(f"brace_delta={stats.brace_delta}")
     if stats.paren_delta != 0:
@@ -179,6 +203,127 @@ def split_horizontal_windows(
             continue
         crops.append(image.crop((left, 0, right, height)))
     return crops
+
+
+def _fill_short_false_runs(mask: np.ndarray, max_gap_width: int) -> np.ndarray:
+    if max_gap_width <= 0 or mask.size == 0:
+        return mask
+    filled = mask.copy()
+    idx = 0
+    width = len(filled)
+    while idx < width:
+        if filled[idx]:
+            idx += 1
+            continue
+        start = idx
+        while idx < width and not filled[idx]:
+            idx += 1
+        end = idx
+        if start > 0 and end < width and end - start <= max_gap_width:
+            filled[start:end] = True
+    return filled
+
+
+def _mask_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    idx = 0
+    width = len(mask)
+    while idx < width:
+        if not mask[idx]:
+            idx += 1
+            continue
+        start = idx
+        while idx < width and mask[idx]:
+            idx += 1
+        runs.append((start, idx))
+    return runs
+
+
+def _merge_segments_to_limit(
+    segments: list[tuple[int, int]],
+    max_segments: int,
+) -> list[tuple[int, int]]:
+    segments = list(segments)
+    while len(segments) > max_segments and len(segments) > 1:
+        gaps = [
+            (segments[idx + 1][0] - segments[idx][1], idx)
+            for idx in range(len(segments) - 1)
+        ]
+        _, merge_idx = min(gaps, key=lambda item: item[0])
+        left = segments[merge_idx]
+        right = segments[merge_idx + 1]
+        segments[merge_idx : merge_idx + 2] = [(left[0], right[1])]
+    return segments
+
+
+def _merge_narrow_segments(
+    segments: list[tuple[int, int]],
+    min_width: int,
+) -> list[tuple[int, int]]:
+    if len(segments) <= 1 or min_width <= 0:
+        return segments
+    merged: list[tuple[int, int]] = []
+    for left, right in segments:
+        width = right - left
+        if merged and width < min_width:
+            prev_left, _ = merged[-1]
+            merged[-1] = (prev_left, right)
+        else:
+            merged.append((left, right))
+    if len(merged) > 1 and merged[0][1] - merged[0][0] < min_width:
+        first = merged.pop(0)
+        next_left, next_right = merged[0]
+        merged[0] = (first[0], next_right)
+    return merged
+
+
+def split_ink_components(
+    image: Image.Image,
+    cfg: TwoPassDecodeConfig,
+) -> list[Image.Image]:
+    image = _trim_white_border(image, cfg.trim_threshold)
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return []
+    arr = np.asarray(image.convert("L"), dtype=np.uint8)
+    ink = arr < max(0, 255 - cfg.trim_threshold)
+    if not ink.any():
+        return []
+    max_gap_ink = max(1, int(round(height * cfg.gap_ink_fraction)))
+    column_has_ink = ink.sum(axis=0) > max_gap_ink
+    column_has_ink = _fill_short_false_runs(column_has_ink, cfg.min_gap_width)
+    runs = _mask_runs(column_has_ink)
+    if len(runs) < 2:
+        return []
+    segments = [
+        (
+            max(0, left - cfg.component_padding),
+            min(width, right + cfg.component_padding),
+        )
+        for left, right in runs
+    ]
+    segments = _merge_narrow_segments(segments, cfg.min_component_width)
+    segments = _merge_segments_to_limit(segments, cfg.max_crops)
+    if len(segments) < 2:
+        return []
+    return [image.crop((left, 0, right, height)) for left, right in segments]
+
+
+def split_component_crops(
+    image: Image.Image,
+    cfg: TwoPassDecodeConfig,
+) -> list[Image.Image]:
+    strategy = cfg.split_strategy.lower()
+    if strategy in {"ink", "ink_components"}:
+        return split_ink_components(image, cfg)
+    if strategy in {"windows", "horizontal_windows"}:
+        return split_horizontal_windows(image, cfg)
+    if strategy not in {"auto", "ink_or_windows"}:
+        raise ValueError(f"Unsupported two-pass split_strategy: {cfg.split_strategy}")
+    crops = split_ink_components(image, cfg)
+    if len(crops) >= 2:
+        return crops
+    return split_horizontal_windows(image, cfg)
 
 
 def _longest_token_overlap(
@@ -294,7 +439,7 @@ def decode_components_for_image(
             component_predictions=(),
         )
 
-    crops = split_horizontal_windows(trimmed, cfg)
+    crops = split_component_crops(trimmed, cfg)
     if len(crops) < 2:
         return TwoPassDecodeResult(
             prediction=first_pass_prediction,

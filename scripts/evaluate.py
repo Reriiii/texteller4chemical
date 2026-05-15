@@ -188,6 +188,36 @@ def parse_args() -> argparse.Namespace:
         help="Fractional overlap between adjacent horizontal crops.",
     )
     parser.add_argument(
+        "--two_pass_split_strategy",
+        choices=["auto", "ink_or_windows", "ink", "windows"],
+        default="ink_or_windows",
+        help="How to split second-pass crops: ink gaps, sliding windows, or ink with window fallback.",
+    )
+    parser.add_argument(
+        "--two_pass_min_gap_width",
+        type=int,
+        default=10,
+        help="Minimum vertical whitespace gap width, in pixels, for ink-based component splitting.",
+    )
+    parser.add_argument(
+        "--two_pass_gap_ink_fraction",
+        type=float,
+        default=0.01,
+        help="A column with at most this fraction of ink pixels is treated as whitespace.",
+    )
+    parser.add_argument(
+        "--two_pass_component_padding",
+        type=int,
+        default=6,
+        help="Horizontal padding, in pixels, around ink-based component crops.",
+    )
+    parser.add_argument(
+        "--two_pass_min_component_width",
+        type=int,
+        default=48,
+        help="Narrow ink components are merged into neighbors below this width.",
+    )
+    parser.add_argument(
         "--two_pass_max_crops",
         type=int,
         default=5,
@@ -222,6 +252,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.25,
         help="Reject stitched output longer than this token-count ratio versus the first pass.",
+    )
+    parser.add_argument(
+        "--two_pass_min_first_pass_tokens",
+        type=int,
+        default=96,
+        help="Trigger two-pass when the first-pass markup token count reaches this value.",
+    )
+    parser.add_argument(
+        "--two_pass_trigger_reaction_markers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Trigger two-pass when the first pass contains reaction markers such as arrows or plus signs.",
+    )
+    parser.add_argument(
+        "--two_pass_trigger_multi_chemfig",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Trigger two-pass when the first pass contains multiple chemfig blocks.",
+    )
+    parser.add_argument(
+        "--two_pass_min_chemfig_count",
+        type=int,
+        default=2,
+        help="Minimum first-pass chemfig count for multi-chemfig triggering.",
     )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
@@ -620,12 +674,21 @@ def two_pass_config_from_args(args: argparse.Namespace) -> TwoPassDecodeConfig:
         min_aspect_ratio=float(args.two_pass_min_aspect_ratio),
         window_aspect_ratio=float(args.two_pass_window_aspect_ratio),
         overlap_ratio=float(args.two_pass_overlap_ratio),
+        split_strategy=str(args.two_pass_split_strategy),
+        min_gap_width=int(args.two_pass_min_gap_width),
+        gap_ink_fraction=float(args.two_pass_gap_ink_fraction),
+        component_padding=int(args.two_pass_component_padding),
+        min_component_width=int(args.two_pass_min_component_width),
         max_crops=int(args.two_pass_max_crops),
         crop_max_new_tokens=crop_max_new_tokens,
         selection=str(args.two_pass_selection),
         min_length_gain_tokens=int(args.two_pass_min_length_gain_tokens),
         min_length_ratio=float(args.two_pass_min_length_ratio),
         max_length_ratio=float(args.two_pass_max_length_ratio),
+        min_first_pass_tokens=int(args.two_pass_min_first_pass_tokens),
+        trigger_reaction_markers=bool(args.two_pass_trigger_reaction_markers),
+        trigger_multi_chemfig=bool(args.two_pass_trigger_multi_chemfig),
+        min_chemfig_count=int(args.two_pass_min_chemfig_count),
     )
 
 

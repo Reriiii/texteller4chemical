@@ -60,6 +60,10 @@ from chemtexteller.model_loader import (
     resize_token_embeddings_if_needed,
 )
 from chemtexteller.rfl_msd_loss import RflMsdBranchClassifier, RflMsdLoss, sequence_cross_entropy
+from chemtexteller.tokenizer_utils import (
+    add_chemical_tokens,
+    extract_chemical_tokens_from_sources,
+)
 from chemtexteller.transforms import build_transform
 from chemtexteller.utils import ensure_dir, load_yaml, save_json, save_yaml, set_seed, setup_logging
 
@@ -340,6 +344,118 @@ def log_trainable_parameter_summary(model: torch.nn.Module) -> None:
     )
 
 
+def _config_list(value: Any, default: Sequence[str] | None = None) -> list[str]:
+    if value is None:
+        return list(default or [])
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, Sequence):
+        return [str(item) for item in value]
+    raise TypeError(f"Expected string/list config value, got {type(value).__name__}")
+
+
+def _resolve_project_path(path_value: str | Path) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+def _tokenizer_chemical_cfg(config: dict[str, Any]) -> dict[str, Any] | None:
+    tokenizer_cfg = config.get("tokenizer", {})
+    if not isinstance(tokenizer_cfg, dict):
+        return None
+    chemical_cfg = tokenizer_cfg.get("chemical_tokens", {})
+    if not isinstance(chemical_cfg, dict) or not bool(chemical_cfg.get("enabled", False)):
+        return None
+    return chemical_cfg
+
+
+def maybe_extend_tokenizer_with_chemical_tokens(
+    tokenizer: Any,
+    config: dict[str, Any],
+    *,
+    dataset_dir: Path,
+    output_dir: Path,
+) -> int:
+    chemical_cfg = _tokenizer_chemical_cfg(config)
+    if chemical_cfg is None:
+        return 0
+
+    sources = [_resolve_project_path(path) for path in _config_list(chemical_cfg.get("sources"))]
+    split_to_file = {
+        "train": dataset_dir / "train" / "metadata.jsonl",
+        "validation": dataset_dir / "validation" / "metadata.jsonl",
+        "test": dataset_dir / "test" / "metadata.jsonl",
+    }
+    include_splits = _config_list(chemical_cfg.get("include_metadata_splits"))
+    for split in include_splits:
+        if split not in split_to_file:
+            raise ValueError(
+                "tokenizer.chemical_tokens.include_metadata_splits contains "
+                f"unsupported split '{split}'. Expected one of {sorted(split_to_file)}."
+            )
+        sources.append(split_to_file[split])
+    sources = list(dict.fromkeys(sources))
+    if not sources:
+        raise ValueError(
+            "tokenizer.chemical_tokens.enabled=true requires sources or include_metadata_splits."
+        )
+
+    csv_fields = _config_list(
+        chemical_cfg.get("csv_fields"),
+        default=("ground_truth", "graph_label", "prediction", "raw_prediction"),
+    )
+    metadata_target_keys = _config_list(
+        chemical_cfg.get("metadata_target_keys"),
+        default=("targets.ssml_graph_norm", "targets.ssml_normed"),
+    )
+    tokens, counts = extract_chemical_tokens_from_sources(
+        sources,
+        csv_fields=csv_fields,
+        metadata_target_keys=metadata_target_keys,
+        min_frequency=int(chemical_cfg.get("min_frequency", 10)),
+        max_tokens=(
+            None
+            if chemical_cfg.get("max_tokens") in {None, 0, "0"}
+            else int(chemical_cfg.get("max_tokens"))
+        ),
+        max_rows_per_source=(
+            None
+            if chemical_cfg.get("max_rows_per_source") in {None, 0, "0"}
+            else int(chemical_cfg.get("max_rows_per_source"))
+        ),
+        include_default_tokens=bool(chemical_cfg.get("include_default_tokens", True)),
+    )
+    explicit_tokens = _config_list(chemical_cfg.get("tokens"))
+    selected_tokens = list(dict.fromkeys(explicit_tokens + tokens))
+    added = add_chemical_tokens(tokenizer, selected_tokens)
+
+    ensure_dir(output_dir)
+    token_path = output_dir / "chemical_tokens.selected.txt"
+    count_path = output_dir / "chemical_tokens.counts.json"
+    token_path.write_text("\n".join(selected_tokens) + "\n", encoding="utf-8")
+    save_json(
+        {
+            "added": added,
+            "selected": len(selected_tokens),
+            "sources": [str(path) for path in sources],
+            "min_frequency": int(chemical_cfg.get("min_frequency", 10)),
+            "max_tokens": chemical_cfg.get("max_tokens"),
+            "counts": {token: counts[token] for token in selected_tokens},
+        },
+        count_path,
+    )
+    logger.info(
+        "Chemical tokenizer extension | selected=%s added=%s sources=%s token_file=%s",
+        len(selected_tokens),
+        added,
+        [str(path) for path in sources],
+        token_path,
+    )
+    return added
+
+
 def _length_balanced_cfg(config: dict[str, Any]) -> dict[str, Any] | None:
     sampling_cfg = config.get("sampling", {})
     if not isinstance(sampling_cfg, dict):
@@ -381,6 +497,23 @@ def _target_token_lengths(dataset: Any, batch_size: int = 512) -> list[int]:
     return lengths
 
 
+def _target_whitespace_lengths(dataset: Any) -> list[int]:
+    return [len(text.split()) for text in _target_texts(dataset)]
+
+
+def _target_lengths(dataset: Any, cfg: dict[str, Any]) -> list[int]:
+    metric = str(cfg.get("length_metric", cfg.get("metric", "tokenized"))).lower()
+    if metric in {"tokenized", "tokenizer", "subtoken"}:
+        batch_size = int(cfg.get("length_batch_size", 512))
+        return _target_token_lengths(dataset, batch_size=batch_size)
+    if metric in {"whitespace", "target_tokens", "raw"}:
+        return _target_whitespace_lengths(dataset)
+    raise ValueError(
+        "Unsupported sampling.length_balanced.length_metric="
+        f"{metric!r}. Use 'tokenized' or 'whitespace'."
+    )
+
+
 def _as_float(value: Any, *, default: float) -> float:
     if value is None:
         return default
@@ -413,8 +546,7 @@ def _build_length_balanced_weights(dataset: Any, cfg: dict[str, Any]) -> torch.D
         normalized_bins.append(dict(bin_cfg))
 
     default_weight = _as_float(cfg.get("default_weight"), default=1.0)
-    batch_size = int(cfg.get("length_batch_size", 512))
-    lengths = _target_token_lengths(dataset, batch_size=batch_size)
+    lengths = _target_lengths(dataset, cfg)
     weights = [
         _length_bin_weight(length, normalized_bins, default_weight=default_weight)
         for length in lengths
@@ -424,7 +556,8 @@ def _build_length_balanced_weights(dataset: Any, cfg: dict[str, Any]) -> torch.D
         key = f"w={weight:g}"
         counts[key] = counts.get(key, 0) + 1
     logger.info(
-        "Length-balanced sampling enabled | samples=%s min_len=%s p50_len=%s p95_len=%s max_len=%s weight_counts=%s",
+        "Length-balanced sampling enabled | metric=%s samples=%s min_len=%s p50_len=%s p95_len=%s max_len=%s weight_counts=%s",
+        str(cfg.get("length_metric", cfg.get("metric", "tokenized"))),
         len(lengths),
         min(lengths) if lengths else 0,
         int(torch.tensor(lengths, dtype=torch.float32).quantile(0.50).item()) if lengths else 0,
@@ -1274,6 +1407,19 @@ def main() -> None:
         device=None,
         trust_remote_code=args.trust_remote_code,
     )
+    added_chemical_tokens = maybe_extend_tokenizer_with_chemical_tokens(
+        bundle.tokenizer,
+        config,
+        dataset_dir=args.dataset_dir,
+        output_dir=args.output_dir,
+    )
+    if added_chemical_tokens > 0 and args.resume_from_checkpoint:
+        logger.warning(
+            "Chemical tokens were added while --resume_from_checkpoint is set. "
+            "Prefer loading the previous best checkpoint via --pretrained_model_name_or_path "
+            "and writing to a fresh output_dir, because optimizer states from the old vocab "
+            "usually do not match resized embeddings."
+        )
     resize_token_embeddings_if_needed(bundle.model, bundle.tokenizer)
 
     freeze_cfg = config.get("freeze", {})

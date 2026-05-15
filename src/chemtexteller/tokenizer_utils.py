@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 from collections import Counter
 from pathlib import Path
+import re
 from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -10,6 +12,25 @@ from .utils import read_jsonl
 
 
 SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
+CHEMICAL_MARKUP_RE = re.compile(
+    r"branch\(|branch\)"
+    r"|\\[A-Za-z]+"
+    r"|\?\[[^\]]+\]"
+    r"|[-=~<>:|]*\[:\s*-?\d+(?:\.\d+)?,\s*\d+(?:\.\d+)?\]"
+)
+
+DEFAULT_CHEMICAL_TOKENS = [
+    r"\chemfig",
+    r"\circle",
+    r"\Chemabove",
+    r"\Charge",
+    r"\lewis",
+    r"\rightarrow",
+    r"\xrightarrow",
+    r"\xrightleftharpoons",
+    "branch(",
+    "branch)",
+]
 
 
 def whitespace_tokenize(text: str) -> list[str]:
@@ -76,6 +97,127 @@ def token_counter(targets: list[str]) -> Counter[str]:
     for target in targets:
         counter.update(whitespace_tokenize(target))
     return counter
+
+
+def _nested_get(row: dict[str, Any], key: str) -> Any:
+    value: Any = row
+    for part in key.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def chemical_markup_tokens(text: str) -> list[str]:
+    return CHEMICAL_MARKUP_RE.findall(str(text or ""))
+
+
+def is_chemical_token_candidate(token: str) -> bool:
+    token = token.strip()
+    if not token:
+        return False
+    if token in {"branch(", "branch)"}:
+        return True
+    if token.startswith("\\") and len(token) > 1:
+        return True
+    if token.startswith("?[") and token.endswith("]"):
+        return True
+    if "[:" in token and token.endswith("]"):
+        return True
+    return False
+
+
+def chemical_token_counter(texts: list[str]) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    for text in texts:
+        for token in whitespace_tokenize(text) + chemical_markup_tokens(text):
+            token = token.strip()
+            if is_chemical_token_candidate(token):
+                counter[token] += 1
+    return counter
+
+
+def load_texts_from_csv(
+    path: Path,
+    fields: list[str],
+    max_rows: int | None = None,
+) -> list[str]:
+    texts: list[str] = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row_idx, row in enumerate(reader):
+            if max_rows is not None and row_idx >= max_rows:
+                break
+            for field in fields:
+                value = row.get(field)
+                if isinstance(value, str) and value.strip():
+                    texts.append(value)
+    return texts
+
+
+def load_texts_from_metadata(
+    path: Path,
+    target_keys: list[str],
+    max_rows: int | None = None,
+) -> list[str]:
+    rows = read_jsonl(path)
+    texts: list[str] = []
+    for row_idx, row in enumerate(rows):
+        if max_rows is not None and row_idx >= max_rows:
+            break
+        for key in target_keys:
+            try:
+                value = target_from_metadata_row(row, key)
+            except KeyError:
+                nested = _nested_get(row, key)
+                value = nested if isinstance(nested, str) else ""
+            if isinstance(value, str) and value.strip():
+                texts.append(value)
+    return texts
+
+
+def extract_chemical_tokens_from_sources(
+    sources: list[Path],
+    *,
+    csv_fields: list[str],
+    metadata_target_keys: list[str],
+    min_frequency: int = 10,
+    max_tokens: int | None = None,
+    max_rows_per_source: int | None = None,
+    include_default_tokens: bool = True,
+) -> tuple[list[str], Counter[str]]:
+    counter: Counter[str] = Counter()
+    for source in sources:
+        if not source.exists():
+            raise FileNotFoundError(f"Chemical-token source does not exist: {source}")
+        suffix = source.suffix.lower()
+        if suffix == ".csv":
+            texts = load_texts_from_csv(source, csv_fields, max_rows=max_rows_per_source)
+        elif suffix in {".jsonl", ".json"}:
+            texts = load_texts_from_metadata(
+                source,
+                metadata_target_keys,
+                max_rows=max_rows_per_source,
+            )
+        else:
+            with source.open("r", encoding="utf-8") as f:
+                texts = [line.strip() for line in f if line.strip()]
+                if max_rows_per_source is not None:
+                    texts = texts[:max_rows_per_source]
+        counter.update(chemical_token_counter(texts))
+
+    if include_default_tokens:
+        for token in DEFAULT_CHEMICAL_TOKENS:
+            counter.setdefault(token, min_frequency)
+
+    tokens = [
+        token
+        for token, count in sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+        if count >= min_frequency
+    ]
+    if max_tokens is not None and max_tokens > 0:
+        tokens = tokens[:max_tokens]
+    return tokens, counter
 
 
 def build_special_token_kwargs(tokenizer: PreTrainedTokenizerBase) -> dict[str, str]:
