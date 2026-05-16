@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from transformers import (
@@ -33,6 +33,13 @@ class LoadedModelBundle:
     processor: Any | None
     source: str
     model_type: str
+
+
+@dataclass(frozen=True)
+class AddedTokenInit:
+    token: str
+    new_id: int
+    source_ids: tuple[int, ...]
 
 
 def _load_tokenizer(
@@ -363,6 +370,87 @@ def resize_token_embeddings_if_needed(
         "If you extended the tokenizer, the TexTeller decoder embedding and output head must "
         "support resizing or be manually replaced."
     )
+
+
+def initialize_new_token_embeddings_from_subtokens(
+    model: torch.nn.Module,
+    specs: Sequence[AddedTokenInit],
+) -> int:
+    if not specs:
+        return 0
+    input_embedding = _find_input_embedding(model)
+    if input_embedding is None or not hasattr(input_embedding, "weight"):
+        logger.warning("Could not find decoder input embeddings for new-token initialization.")
+        return 0
+    input_weight = input_embedding.weight
+    initialized = _initialize_weight_rows(input_weight, specs)
+    output_embedding = _find_output_embedding(model)
+    if (
+        output_embedding is not None
+        and hasattr(output_embedding, "weight")
+        and output_embedding.weight is not input_weight
+    ):
+        _initialize_weight_rows(output_embedding.weight, specs)
+    logger.info(
+        "Initialized %s added token embedding row(s) from old subtoken averages.",
+        initialized,
+    )
+    return initialized
+
+
+def _initialize_weight_rows(
+    weight: torch.Tensor,
+    specs: Sequence[AddedTokenInit],
+) -> int:
+    initialized = 0
+    with torch.no_grad():
+        for spec in specs:
+            if spec.new_id < 0 or spec.new_id >= weight.shape[0] or not spec.source_ids:
+                continue
+            source_ids = [
+                token_id
+                for token_id in spec.source_ids
+                if 0 <= token_id < weight.shape[0] and token_id != spec.new_id
+            ]
+            if not source_ids:
+                continue
+            source = torch.as_tensor(source_ids, device=weight.device, dtype=torch.long)
+            weight[spec.new_id].copy_(weight.index_select(0, source).mean(dim=0))
+            initialized += 1
+    return initialized
+
+
+def _find_input_embedding(model: torch.nn.Module) -> Any | None:
+    for obj in (model, getattr(model, "decoder", None), _safe_get_decoder(model)):
+        if obj is None or not hasattr(obj, "get_input_embeddings"):
+            continue
+        try:
+            embedding = obj.get_input_embeddings()
+        except Exception:
+            continue
+        if embedding is not None and hasattr(embedding, "weight"):
+            return embedding
+    return None
+
+
+def _find_output_embedding(model: torch.nn.Module) -> Any | None:
+    candidates: list[Any] = [model, getattr(model, "decoder", None), _safe_get_decoder(model)]
+    for obj in candidates:
+        if obj is None:
+            continue
+        get_output = getattr(obj, "get_output_embeddings", None)
+        if callable(get_output):
+            try:
+                embedding = get_output()
+            except Exception:
+                embedding = None
+            if embedding is not None and hasattr(embedding, "weight"):
+                return embedding
+        for attr in ("output_projection", "lm_head"):
+            embedding = getattr(obj, attr, None)
+            if embedding is not None and hasattr(embedding, "weight"):
+                return embedding
+    return None
 
 
 def _current_embedding_size(model: torch.nn.Module) -> int | None:

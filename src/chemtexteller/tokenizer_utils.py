@@ -31,6 +31,7 @@ DEFAULT_CHEMICAL_TOKENS = [
     "branch(",
     "branch)",
 ]
+TOKEN_CATEGORIES = {"branch", "macro", "ring_marker", "bond_geometry", "other"}
 
 
 def whitespace_tokenize(text: str) -> list[str]:
@@ -127,6 +128,19 @@ def is_chemical_token_candidate(token: str) -> bool:
     return False
 
 
+def chemical_token_category(token: str) -> str:
+    token = token.strip()
+    if token in {"branch(", "branch)"}:
+        return "branch"
+    if token.startswith("\\") and len(token) > 1:
+        return "macro"
+    if token.startswith("?[") and token.endswith("]"):
+        return "ring_marker"
+    if "[:" in token and token.endswith("]"):
+        return "bond_geometry"
+    return "other"
+
+
 def chemical_token_counter(texts: list[str]) -> Counter[str]:
     counter: Counter[str] = Counter()
     for text in texts:
@@ -183,6 +197,9 @@ def extract_chemical_tokens_from_sources(
     metadata_target_keys: list[str],
     min_frequency: int = 10,
     max_tokens: int | None = None,
+    include_categories: set[str] | None = None,
+    exclude_categories: set[str] | None = None,
+    max_tokens_per_category: dict[str, int] | None = None,
     max_rows_per_source: int | None = None,
     include_default_tokens: bool = True,
 ) -> tuple[list[str], Counter[str]]:
@@ -210,11 +227,33 @@ def extract_chemical_tokens_from_sources(
         for token in DEFAULT_CHEMICAL_TOKENS:
             counter.setdefault(token, min_frequency)
 
-    tokens = [
-        token
-        for token, count in sorted(counter.items(), key=lambda item: (-item[1], item[0]))
-        if count >= min_frequency
-    ]
+    if include_categories:
+        unknown = set(include_categories) - TOKEN_CATEGORIES
+        if unknown:
+            raise ValueError(f"Unknown include_categories: {sorted(unknown)}")
+    if exclude_categories:
+        unknown = set(exclude_categories) - TOKEN_CATEGORIES
+        if unknown:
+            raise ValueError(f"Unknown exclude_categories: {sorted(unknown)}")
+    per_category_counts: Counter[str] = Counter()
+    tokens: list[str] = []
+    for token, count in sorted(counter.items(), key=lambda item: (-item[1], item[0])):
+        if count < min_frequency:
+            continue
+        category = chemical_token_category(token)
+        if include_categories and category not in include_categories:
+            continue
+        if exclude_categories and category in exclude_categories:
+            continue
+        category_limit = (
+            max_tokens_per_category.get(category)
+            if isinstance(max_tokens_per_category, dict)
+            else None
+        )
+        if category_limit is not None and per_category_counts[category] >= int(category_limit):
+            continue
+        tokens.append(token)
+        per_category_counts[category] += 1
     if max_tokens is not None and max_tokens > 0:
         tokens = tokens[:max_tokens]
     return tokens, counter

@@ -53,9 +53,11 @@ from chemtexteller.inference import (
 )
 from chemtexteller.metrics import sequence_metrics
 from chemtexteller.model_loader import (
+    AddedTokenInit,
     add_texteller_repo_to_path,
     enable_gradient_checkpointing_if_available,
     freeze_encoder_if_available,
+    initialize_new_token_embeddings_from_subtokens,
     load_pretrained_model_and_tokenizer,
     resize_token_embeddings_if_needed,
 )
@@ -354,6 +356,19 @@ def _config_list(value: Any, default: Sequence[str] | None = None) -> list[str]:
     raise TypeError(f"Expected string/list config value, got {type(value).__name__}")
 
 
+def _config_set(value: Any) -> set[str] | None:
+    items = _config_list(value)
+    return set(items) if items else None
+
+
+def _config_int_map(value: Any) -> dict[str, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError(f"Expected mapping config value, got {type(value).__name__}")
+    return {str(key): int(item) for key, item in value.items()}
+
+
 def _resolve_project_path(path_value: str | Path) -> Path:
     path = Path(path_value)
     if path.is_absolute():
@@ -377,10 +392,10 @@ def maybe_extend_tokenizer_with_chemical_tokens(
     *,
     dataset_dir: Path,
     output_dir: Path,
-) -> int:
+) -> list[AddedTokenInit]:
     chemical_cfg = _tokenizer_chemical_cfg(config)
     if chemical_cfg is None:
-        return 0
+        return []
 
     sources = [_resolve_project_path(path) for path in _config_list(chemical_cfg.get("sources"))]
     split_to_file = {
@@ -420,6 +435,11 @@ def maybe_extend_tokenizer_with_chemical_tokens(
             if chemical_cfg.get("max_tokens") in {None, 0, "0"}
             else int(chemical_cfg.get("max_tokens"))
         ),
+        include_categories=_config_set(chemical_cfg.get("include_categories")),
+        exclude_categories=_config_set(chemical_cfg.get("exclude_categories")),
+        max_tokens_per_category=_config_int_map(
+            chemical_cfg.get("max_tokens_per_category")
+        ),
         max_rows_per_source=(
             None
             if chemical_cfg.get("max_rows_per_source") in {None, 0, "0"}
@@ -429,7 +449,28 @@ def maybe_extend_tokenizer_with_chemical_tokens(
     )
     explicit_tokens = _config_list(chemical_cfg.get("tokens"))
     selected_tokens = list(dict.fromkeys(explicit_tokens + tokens))
+    old_vocab = tokenizer.get_vocab()
+    source_ids_by_token: dict[str, tuple[int, ...]] = {}
+    for token in selected_tokens:
+        if token in old_vocab:
+            continue
+        encoded = tokenizer(token, add_special_tokens=False)
+        ids = encoded.get("input_ids") if isinstance(encoded, dict) else None
+        if isinstance(ids, list) and ids and isinstance(ids[0], list):
+            ids = ids[0]
+        if isinstance(ids, list):
+            source_ids_by_token[token] = tuple(int(token_id) for token_id in ids)
     added = add_chemical_tokens(tokenizer, selected_tokens)
+    new_vocab = tokenizer.get_vocab()
+    init_specs = [
+        AddedTokenInit(
+            token=token,
+            new_id=int(new_vocab[token]),
+            source_ids=source_ids,
+        )
+        for token, source_ids in source_ids_by_token.items()
+        if token in new_vocab and int(new_vocab[token]) >= len(old_vocab)
+    ]
 
     ensure_dir(output_dir)
     token_path = output_dir / "chemical_tokens.selected.txt"
@@ -442,6 +483,22 @@ def maybe_extend_tokenizer_with_chemical_tokens(
             "sources": [str(path) for path in sources],
             "min_frequency": int(chemical_cfg.get("min_frequency", 10)),
             "max_tokens": chemical_cfg.get("max_tokens"),
+            "include_categories": chemical_cfg.get("include_categories"),
+            "exclude_categories": chemical_cfg.get("exclude_categories"),
+            "max_tokens_per_category": chemical_cfg.get("max_tokens_per_category"),
+            "initialization": (
+                "subtoken_average"
+                if bool(chemical_cfg.get("initialize_from_subtokens", True))
+                else "default_resize_init"
+            ),
+            "init_specs": [
+                {
+                    "token": spec.token,
+                    "new_id": spec.new_id,
+                    "source_ids": list(spec.source_ids),
+                }
+                for spec in init_specs
+            ],
             "counts": {token: counts[token] for token in selected_tokens},
         },
         count_path,
@@ -453,7 +510,9 @@ def maybe_extend_tokenizer_with_chemical_tokens(
         [str(path) for path in sources],
         token_path,
     )
-    return added
+    if not bool(chemical_cfg.get("initialize_from_subtokens", True)):
+        return []
+    return init_specs
 
 
 def _length_balanced_cfg(config: dict[str, Any]) -> dict[str, Any] | None:
@@ -1407,13 +1466,13 @@ def main() -> None:
         device=None,
         trust_remote_code=args.trust_remote_code,
     )
-    added_chemical_tokens = maybe_extend_tokenizer_with_chemical_tokens(
+    added_token_init_specs = maybe_extend_tokenizer_with_chemical_tokens(
         bundle.tokenizer,
         config,
         dataset_dir=args.dataset_dir,
         output_dir=args.output_dir,
     )
-    if added_chemical_tokens > 0 and args.resume_from_checkpoint:
+    if added_token_init_specs and args.resume_from_checkpoint:
         logger.warning(
             "Chemical tokens were added while --resume_from_checkpoint is set. "
             "Prefer loading the previous best checkpoint via --pretrained_model_name_or_path "
@@ -1421,6 +1480,7 @@ def main() -> None:
             "usually do not match resized embeddings."
         )
     resize_token_embeddings_if_needed(bundle.model, bundle.tokenizer)
+    initialize_new_token_embeddings_from_subtokens(bundle.model, added_token_init_specs)
 
     freeze_cfg = config.get("freeze", {})
     if args.freeze_encoder or bool(freeze_cfg.get("encoder", False)):

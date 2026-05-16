@@ -41,11 +41,9 @@ augmentation:
 tokenizer:
   chemical_tokens:
     enabled: true
-    sources:
-      - outputs/eval_graph_norm_test_beam3.csv
+    sources: []
     include_metadata_splits:
       - train
-      - validation
     csv_fields:
       - ground_truth
       - graph_label
@@ -53,9 +51,19 @@ tokenizer:
       - raw_prediction
     metadata_target_keys:
       - targets.ssml_graph_norm
-      - targets.ssml_normed
-    min_frequency: 20
-    max_tokens: 768
+    min_frequency: 30
+    max_tokens: 48
+    include_categories:
+      - branch
+      - macro
+      - ring_marker
+    exclude_categories:
+      - bond_geometry
+    max_tokens_per_category:
+      branch: 2
+      macro: 16
+      ring_marker: 30
+    initialize_from_subtokens: true
     include_default_tokens: true
     tokens:
       - '\chemfig'
