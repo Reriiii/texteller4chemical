@@ -52,7 +52,7 @@ tokenizer:
     metadata_target_keys:
       - targets.ssml_graph_norm
     min_frequency: 30
-    max_tokens: 48
+    max_tokens: 25
     include_categories:
       - branch
       - macro
@@ -64,31 +64,8 @@ tokenizer:
       macro: 16
       ring_marker: 30
     initialize_from_subtokens: true
-    include_default_tokens: true
-    tokens:
-      - '\chemfig'
-      - '\circle'
-      - '\Chemabove'
-      - '\Charge'
-      - '\lewis'
-      - '\rightarrow'
-      - '\xrightarrow'
-      - '\xrightleftharpoons'
-      - 'branch('
-      - 'branch)'
-      - '?[a]'
-      - '?[b]'
-      - '?[c]'
-      - '?[d]'
-      - '?[e]'
-      - '?[a,{-}]'
-      - '?[b,{-}]'
-      - '?[c,{-}]'
-      - '?[d,{-}]'
-      - '?[e,{-}]'
-      - '?[a,{=}]'
-      - '?[b,{=}]'
-      - '?[c,{=}]'
+    include_default_tokens: false
+    tokens: []
 
 sampling:
   length_balanced:
