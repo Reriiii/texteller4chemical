@@ -1,0 +1,145 @@
+seed: 42
+max_target_length: 1024
+
+data:
+  target_key: targets.ssml_graph_norm
+  train_target_key: targets.ssml_graph_norm
+  eval_target_key: targets.ssml_graph_norm
+  target_length_policy: filter
+
+image_size:
+  height: 448
+  width: 448
+  channels: 1
+  pad_value: 255
+  trim_white_border: true
+  trim_threshold: 15
+  resize_mode: texteller
+  pad_position: top_left
+  normalize_mean: 0.9545467
+  normalize_std: 0.15394445
+
+augmentation:
+  enabled: true
+  profile: texteller_ocr
+  random_resize_min: 0.75
+  random_resize_max: 1.15
+  rotate_prob: 0.20
+  rotate_degrees: 5.0
+  random_border_max: 25
+  min_augmented_size: 30
+  augraphy_enabled: true
+  max_augmentation_side: 4096
+  log_augmentation_downscale: false
+  brightness: 0.05
+  contrast: 0.05
+  gaussian_blur_prob: 0.02
+  affine_degrees: 1.0
+  affine_translate: 0.005
+  random_erasing_prob: 0.00
+
+tokenizer:
+  chemical_tokens:
+    enabled: true
+    sources: []
+    token_files:
+      - configs/chemical_tokens_token88_no_bond.txt
+    include_metadata_splits: []
+    csv_fields: []
+    metadata_target_keys: []
+    min_frequency: 1
+    max_tokens: 0
+    include_categories: []
+    exclude_categories:
+      - bond_geometry
+      - other
+    max_tokens_per_category: {}
+    initialize_from_subtokens: true
+    include_default_tokens: false
+    tokens: []
+
+sampling:
+  length_balanced:
+    enabled: true
+    length_metric: whitespace
+    bins:
+      - max_length: 64
+        weight: 1.0
+      - max_length: 96
+        weight: 2.0
+      - max_length: 128
+        weight: 3.5
+      - max_length: 192
+        weight: 7.0
+      - max_length: 256
+        weight: 9.0
+      - max_length: null
+        weight: 10.0
+
+training:
+  num_train_epochs: 20
+  learning_rate: 3.0e-5
+  weight_decay: 0.01
+  warmup_steps: 3000
+  lr_scheduler_type: cosine
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  fp16: false
+  bf16: true
+  gradient_checkpointing: true
+  dataloader_num_workers: 12
+  dataloader_pin_memory: true
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
+  logging_steps: 100
+  logging_strategy: epoch
+  logging_first_step: false
+  log_level: warning
+  log_level_replica: error
+  log_on_each_node: false
+  ddp_find_unused_parameters: false
+  stable_tqdm: true
+  tqdm_by_epoch: true
+  tqdm_mininterval: 5.0
+  tqdm_miniters: 10
+  tqdm_ncols: 100
+  tqdm_ascii: false
+  save_total_limit: 3
+  eval_strategy: epoch
+  save_strategy: epoch
+  load_best_model_at_end: true
+  metric_for_best_model: eval_graph_em
+  greater_is_better: true
+  report_to:
+    - tensorboard
+
+eval_metrics:
+  enabled: true
+  batch_size: 4
+  max_samples: null
+  sample_seed: null
+  num_beams: 3
+  max_new_tokens: 1024
+  use_cache: false
+  length_penalty: 1.05
+  empty_cache: true
+  graph_eval: true
+  graph_matching_tool_dir: external/GraphMatchingTool
+  graph_label_key: ssml_normed
+  graph_num_workers: 8
+  require_graph_eval: true
+
+lora:
+  enabled: false
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules: auto
+  target_scope: all
+  bias: none
+  modules_to_save: null
+
+freeze:
+  encoder: false
