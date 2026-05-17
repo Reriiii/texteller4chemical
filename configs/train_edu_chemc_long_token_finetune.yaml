@@ -42,6 +42,7 @@ tokenizer:
   chemical_tokens:
     enabled: true
     sources: []
+    token_files: []
     include_metadata_splits:
       - train
     csv_fields:

@@ -11,6 +11,7 @@ import random
 import shutil
 import sys
 import warnings
+from collections import Counter
 from datetime import datetime
 from time import perf_counter
 from pathlib import Path
@@ -65,6 +66,7 @@ from chemtexteller.rfl_msd_loss import RflMsdBranchClassifier, RflMsdLoss, seque
 from chemtexteller.tokenizer_utils import (
     add_chemical_tokens,
     extract_chemical_tokens_from_sources,
+    load_vocab_file,
 )
 from chemtexteller.transforms import build_transform
 from chemtexteller.utils import ensure_dir, load_yaml, save_json, save_yaml, set_seed, setup_logging
@@ -412,9 +414,15 @@ def maybe_extend_tokenizer_with_chemical_tokens(
             )
         sources.append(split_to_file[split])
     sources = list(dict.fromkeys(sources))
-    if not sources:
+    explicit_tokens = _config_list(chemical_cfg.get("tokens"))
+    token_files = [
+        _resolve_project_path(path)
+        for path in _config_list(chemical_cfg.get("token_files"))
+    ]
+    if not sources and not token_files and not explicit_tokens:
         raise ValueError(
-            "tokenizer.chemical_tokens.enabled=true requires sources or include_metadata_splits."
+            "tokenizer.chemical_tokens.enabled=true requires sources, "
+            "include_metadata_splits, token_files, or tokens."
         )
 
     csv_fields = _config_list(
@@ -425,29 +433,37 @@ def maybe_extend_tokenizer_with_chemical_tokens(
         chemical_cfg.get("metadata_target_keys"),
         default=("targets.ssml_graph_norm", "targets.ssml_normed"),
     )
-    tokens, counts = extract_chemical_tokens_from_sources(
-        sources,
-        csv_fields=csv_fields,
-        metadata_target_keys=metadata_target_keys,
-        min_frequency=int(chemical_cfg.get("min_frequency", 10)),
-        max_tokens=(
-            None
-            if chemical_cfg.get("max_tokens") in {None, 0, "0"}
-            else int(chemical_cfg.get("max_tokens"))
-        ),
-        include_categories=_config_set(chemical_cfg.get("include_categories")),
-        exclude_categories=_config_set(chemical_cfg.get("exclude_categories")),
-        max_tokens_per_category=_config_int_map(
-            chemical_cfg.get("max_tokens_per_category")
-        ),
-        max_rows_per_source=(
-            None
-            if chemical_cfg.get("max_rows_per_source") in {None, 0, "0"}
-            else int(chemical_cfg.get("max_rows_per_source"))
-        ),
-        include_default_tokens=bool(chemical_cfg.get("include_default_tokens", True)),
-    )
-    explicit_tokens = _config_list(chemical_cfg.get("tokens"))
+    tokens: list[str] = []
+    counts: Counter[str] = Counter()
+    if sources:
+        tokens, counts = extract_chemical_tokens_from_sources(
+            sources,
+            csv_fields=csv_fields,
+            metadata_target_keys=metadata_target_keys,
+            min_frequency=int(chemical_cfg.get("min_frequency", 10)),
+            max_tokens=(
+                None
+                if chemical_cfg.get("max_tokens") in {None, 0, "0"}
+                else int(chemical_cfg.get("max_tokens"))
+            ),
+            include_categories=_config_set(chemical_cfg.get("include_categories")),
+            exclude_categories=_config_set(chemical_cfg.get("exclude_categories")),
+            max_tokens_per_category=_config_int_map(
+                chemical_cfg.get("max_tokens_per_category")
+            ),
+            max_rows_per_source=(
+                None
+                if chemical_cfg.get("max_rows_per_source") in {None, 0, "0"}
+                else int(chemical_cfg.get("max_rows_per_source"))
+            ),
+            include_default_tokens=bool(chemical_cfg.get("include_default_tokens", True)),
+        )
+    for token_file in token_files:
+        if not token_file.exists():
+            raise FileNotFoundError(
+                f"tokenizer.chemical_tokens.token_files entry does not exist: {token_file}"
+            )
+        explicit_tokens.extend(load_vocab_file(token_file))
     selected_tokens = list(dict.fromkeys(explicit_tokens + tokens))
     old_vocab = tokenizer.get_vocab()
     source_ids_by_token: dict[str, tuple[int, ...]] = {}
@@ -481,6 +497,7 @@ def maybe_extend_tokenizer_with_chemical_tokens(
             "added": added,
             "selected": len(selected_tokens),
             "sources": [str(path) for path in sources],
+            "token_files": [str(path) for path in token_files],
             "min_frequency": int(chemical_cfg.get("min_frequency", 10)),
             "max_tokens": chemical_cfg.get("max_tokens"),
             "include_categories": chemical_cfg.get("include_categories"),
@@ -504,10 +521,11 @@ def maybe_extend_tokenizer_with_chemical_tokens(
         count_path,
     )
     logger.info(
-        "Chemical tokenizer extension | selected=%s added=%s sources=%s token_file=%s",
+        "Chemical tokenizer extension | selected=%s added=%s sources=%s token_files=%s token_file=%s",
         len(selected_tokens),
         added,
         [str(path) for path in sources],
+        [str(path) for path in token_files],
         token_path,
     )
     if not bool(chemical_cfg.get("initialize_from_subtokens", True)):
