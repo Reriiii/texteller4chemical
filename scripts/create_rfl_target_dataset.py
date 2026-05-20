@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from multiprocessing import cpu_count
 from pathlib import Path
 from typing import Any
@@ -353,20 +353,29 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
     num_workers = getattr(args, "num_workers", None) or max(1, cpu_count() - 1)
 
     if num_workers > 1:
-        params = [
-            (idx, row, source_keys, args.rfl_tool_dir, args.target_field,
-             args.graph_label_field, args.need_ring_count, args.on_error)
-            for idx, row in enumerate(rows)
-        ]
-        futures = {}
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for p in params:
-                futures[executor.submit(convert_row, *p)] = p[0]
-            results = []
-            for future in as_completed(futures):
-                results.append(future.result())
-        results.sort(key=lambda x: x["idx"])
-        results_list = results
+        batch_size = 100
+        results_list = []
+        total = len(rows)
+        with tqdm(total=total, desc=f"RFL {split} (parallel x{num_workers})") as pbar:
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                pending = {}
+                batch_start = 0
+                while batch_start < total or pending:
+                    while batch_start < total and len(pending) < batch_size:
+                        p = (
+                            batch_start, rows[batch_start], source_keys, args.rfl_tool_dir,
+                            args.target_field, args.graph_label_field, args.need_ring_count,
+                            args.on_error,
+                        )
+                        future = executor.submit(convert_row, *p)
+                        pending[future] = batch_start
+                        batch_start += 1
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        results_list.append(future.result())
+                        del pending[future]
+                        pbar.update(1)
+        results_list.sort(key=lambda x: x["idx"])
     else:
         results_list = [convert_row(idx, row, source_keys, args.rfl_tool_dir, args.target_field,
                                    args.graph_label_field, args.need_ring_count, args.on_error)
