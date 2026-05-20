@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import shutil
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +78,131 @@ def msd_config_from_yaml(config: dict[str, Any]) -> MsdDecoderConfig:
         if key in kwargs and isinstance(kwargs[key], list):
             kwargs[key] = tuple(int(item) for item in kwargs[key])
     return MsdDecoderConfig(**kwargs)
+
+
+def lookup_metadata_value(row: dict[str, Any], key: str) -> Any:
+    value = row.get(key)
+    if value is not None:
+        return value
+    targets = row.get("targets")
+    if isinstance(targets, dict):
+        nested_key = key.split(".", 1)[1] if key.startswith("targets.") else key
+        return targets.get(nested_key)
+    return None
+
+
+def iter_metadata_rows(path: Path):
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if isinstance(row, dict):
+                yield row
+
+
+def iter_rfl_tokens_from_split(
+    split_dir: Path,
+    *,
+    target_key: str,
+    rfl_aux_field: str,
+):
+    metadata_path = split_dir / "metadata.jsonl"
+    if not metadata_path.is_file():
+        return
+    for row in iter_metadata_rows(metadata_path):
+        aux = row.get(rfl_aux_field)
+        tokens = aux.get("tokens") if isinstance(aux, dict) else None
+        if isinstance(tokens, list) and all(isinstance(item, str) for item in tokens):
+            yield list(tokens)
+            continue
+        target = lookup_metadata_value(row, target_key)
+        if isinstance(target, str) and target.strip():
+            yield target.split()
+
+
+def load_rfl_vocab(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+) -> tuple[RflVocab, dict[str, Any]]:
+    vocab_cfg = dict(config.get("vocab") or {})
+    data_cfg = dict(config.get("data") or {})
+    vocab_file = Path(vocab_cfg.get("file", "external/RFL-MSD/dict/vocab.txt"))
+    vocab = RflVocab.from_file(vocab_file)
+    report: dict[str, Any] = {
+        "vocab_file": str(vocab_file),
+        "base_vocab_size": vocab.vocab_size,
+        "extended_from_dataset": False,
+        "added_tokens": 0,
+        "unknown_token_count_before_extension": 0,
+        "unknown_token_top_before_extension": [],
+    }
+    if not bool(vocab_cfg.get("extend_from_dataset", False)):
+        return vocab, report
+
+    split_names = vocab_cfg.get("extend_splits", ["train"])
+    if isinstance(split_names, str):
+        split_names = [item.strip() for item in split_names.split(",") if item.strip()]
+    split_names = [str(item) for item in split_names]
+    min_frequency = int(vocab_cfg.get("min_frequency", 1))
+    max_added = vocab_cfg.get("max_added_tokens")
+    max_added = None if max_added in {None, 0, "0"} else int(max_added)
+    target_key = str(data_cfg.get("target_key", data_cfg.get("train_target_key", "targets.ssml_rfl")))
+    rfl_aux_field = str(data_cfg.get("rfl_aux_field", "rfl"))
+
+    counts: Counter[str] = Counter()
+    ordered_missing: list[str] = []
+    seen_missing: set[str] = set()
+    for split in split_names:
+        for tokens in iter_rfl_tokens_from_split(
+            args.dataset_dir / split,
+            target_key=target_key,
+            rfl_aux_field=rfl_aux_field,
+        ):
+            for token in tokens:
+                if token in vocab.word2id:
+                    continue
+                counts[token] += 1
+                if token not in seen_missing:
+                    seen_missing.add(token)
+                    ordered_missing.append(token)
+
+    word2id = dict(vocab.word2id)
+    id2word = dict(vocab.id2word)
+    next_id = max(id2word) + 1 if id2word else 0
+    added_tokens: list[str] = []
+    for token in ordered_missing:
+        if counts[token] < min_frequency:
+            continue
+        if max_added is not None and len(added_tokens) >= max_added:
+            break
+        word2id[token] = next_id
+        id2word[next_id] = token
+        next_id += 1
+        added_tokens.append(token)
+
+    report.update(
+        {
+            "extended_from_dataset": True,
+            "extend_splits": split_names,
+            "min_frequency": min_frequency,
+            "max_added_tokens": max_added,
+            "unknown_token_count_before_extension": int(sum(counts.values())),
+            "unknown_token_top_before_extension": counts.most_common(50),
+            "added_tokens": len(added_tokens),
+            "added_token_list": added_tokens,
+            "final_vocab_size": max(id2word) + 1 if id2word else 0,
+        }
+    )
+    if added_tokens:
+        logger.info(
+            "Extended RFL vocab from dataset | added=%s splits=%s examples=%s",
+            len(added_tokens),
+            split_names,
+            added_tokens[:10],
+        )
+    return RflVocab(word2id=word2id, id2word=id2word, unk_token=vocab.unk_token), report
 
 
 def dataloader_kwargs(config: dict[str, Any], *, train: bool) -> dict[str, Any]:
@@ -321,9 +448,9 @@ def main() -> None:
     )
     logger.info("Accelerator initialized | processes=%s mixed_precision=%s", accelerator.num_processes, mixed_precision)
 
-    vocab_cfg = dict(config.get("vocab") or {})
-    vocab_file = Path(vocab_cfg.get("file", "external/RFL-MSD/dict/vocab.txt"))
-    vocab = RflVocab.from_file(vocab_file)
+    vocab, vocab_report = load_rfl_vocab(args, config)
+    if accelerator.is_main_process:
+        save_json(vocab_report, args.output_dir / "rfl_vocab_report.json")
     processor = load_processor(args.pretrained_model_name_or_path, args.trust_remote_code)
     train_dataset, eval_dataset = build_datasets(args, config, vocab, processor)
     collator = TextellerMsdCollator(vocab, include_metadata=True)

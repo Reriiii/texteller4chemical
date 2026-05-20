@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "deep-learning": {
+      "source": "mindrally/skills",
+      "sourceType": "github",
+      "skillPath": "deep-learning/SKILL.md",
+      "computedHash": "4590e73ca06533a8927553263a368d12a8e68d8d47da5078fb4073c5191c5bfb"
+    }
+  }
+}

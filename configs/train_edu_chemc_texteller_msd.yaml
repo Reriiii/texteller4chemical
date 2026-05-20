@@ -41,6 +41,11 @@ augmentation:
 
 vocab:
   file: external/RFL-MSD/dict/vocab.txt
+  extend_from_dataset: true
+  extend_splits:
+    - train
+  min_frequency: 1
+  max_added_tokens: null
 
 msd_model:
   encoder_hidden_size: 768
