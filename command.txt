@@ -42,6 +42,7 @@ uv run python scripts/create_rfl_target_dataset.py \
   --target_field ssml_rfl \
   --graph_label_field ssml_rfl_graph_norm \
   --rfl_tool_dir external/RFL-MSD \
+  --num_workers 8 \
   --overwrite \
   --on_error skip
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +16,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from chemtexteller.rfl_adapter import convert_ssml_to_rfl, restore_rfl_text_to_chemfig  # noqa: E402
-from chemtexteller.utils import ensure_dir, read_jsonl, save_json, setup_logging, write_jsonl  # noqa: E402
+from chemtexteller.rfl_adapter import convert_ssml_to_rfl, restore_rfl_text_to_chemfig
+from chemtexteller.utils import ensure_dir, read_jsonl, save_json, setup_logging, write_jsonl
 
 
 logger = setup_logging()
@@ -72,6 +74,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max_samples_per_split", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of parallel workers for RFL conversion. "
+            "Defaults to (CPU cores - 1). Use 1 to disable parallel processing."
+        ),
+    )
     parser.add_argument(
         "--on_error",
         choices=["fallback", "skip", "raise"],
@@ -207,23 +218,112 @@ def msd_connection_token_pairs(msd_aux: dict[str, Any]) -> list[tuple[int, int]]
     return pairs
 
 
-def build_auxiliary_metadata(
-    args: argparse.Namespace,
-    source_key: str,
-    result: Any,
+def convert_row(
+    idx: int,
+    row: dict[str, Any],
+    source_keys: list[str],
+    rfl_tool_dir: Path,
+    target_field: str,
+    graph_label_field: str | None,
+    need_ring_count: bool,
+    on_error: str,
 ) -> dict[str, Any]:
-    return {
-        "source_key": source_key,
-        "source_target_name": target_name(source_key),
-        "target_field": args.target_field,
-        "tool_dir": str(args.rfl_tool_dir),
-        "tokens": list(result.tokens),
-        "branch_info": result.branch_info,
-        "ring_branch_info": result.ring_branch_info,
-        "cond_data": result.cond_data,
-        "ring_count": result.ring_count,
-        "msd": build_msd_auxiliary(result),
-    }
+    image_name = row.get("image_name") or Path(str(row.get("file_name", f"{idx:06d}"))).name
+    source = ""
+    selected_source_key = source_keys[0]
+    result = None
+    validation_error = None
+    source_errors: list[dict[str, str]] = []
+
+    for source_key in source_keys:
+        try:
+            candidate_source = lookup_value(row, source_key)
+        except KeyError:
+            source_errors.append({"source_key": source_key, "error": f"missing source key: {source_key}"})
+            continue
+        candidate_result = convert_ssml_to_rfl(candidate_source, rfl_tool_dir, need_ring_num=need_ring_count)
+        candidate_error = validate_rfl_result(candidate_result)
+        if candidate_error is None:
+            source = candidate_source
+            selected_source_key = source_key
+            result = candidate_result
+            validation_error = None
+            break
+        if validation_error is None:
+            validation_error = candidate_error
+        source_errors.append({"source_key": source_key, "error": candidate_error})
+
+    if validation_error is None and result is None:
+        validation_error = "No source keys could be converted"
+
+    status: str
+    target: str
+    msd_aux: dict[str, Any]
+    graph_label: str | None = None
+
+    if validation_error is None:
+        target = result.target
+        status = "converted"
+        msd_aux = build_msd_auxiliary(result)
+        if graph_label_field:
+            restore = restore_rfl_text_to_chemfig(
+                target,
+                rfl_tool_dir,
+                branch_pairs=msd_connection_token_pairs(msd_aux),
+                cond_data=result.cond_data,
+            )
+            if not restore.success:
+                raise RuntimeError(f"RFL graph-label restore failed for row {idx} ({image_name}): {restore.error}")
+            graph_label = restore.chemfig
+    else:
+        if on_error == "raise":
+            tried = "; ".join(f"{item['source_key']}: {item['error']}" for item in source_errors)
+            raise RuntimeError(f"RFL conversion failed for row {idx} ({image_name}): {validation_error}. Tried: {tried}")
+        if on_error == "skip":
+            return {
+                "idx": idx,
+                "image_name": image_name,
+                "skipped": True,
+                "error": validation_error,
+                "source_errors": source_errors,
+            }
+        selected_source_key = source_keys[0]
+        try:
+            source = lookup_value(row, source_keys[0])
+        except KeyError:
+            source = ""
+        target = source
+        status = "fallback"
+        msd_aux = {}
+        graph_label = None
+
+    targets = dict(row.get("targets") or {})
+    targets[target_name(selected_source_key)] = source
+    targets[target_field] = target
+    if graph_label is not None:
+        targets[graph_label_field] = graph_label
+
+    out_row = dict(row)
+    out_row["image_name"] = image_name
+    out_row["target"] = target
+    out_row["target_field"] = target_field
+    out_row["target_source_key"] = selected_source_key
+    out_row["targets"] = targets
+    out_row["target_status"] = status
+    if status == "converted":
+        out_row["rfl"] = {
+            "source_key": selected_source_key,
+            "source_target_name": target_name(selected_source_key),
+            "target_field": target_field,
+            "tool_dir": str(rfl_tool_dir),
+            "tokens": list(result.tokens),
+            "branch_info": result.branch_info,
+            "ring_branch_info": result.ring_branch_info,
+            "cond_data": result.cond_data,
+            "ring_count": result.ring_count,
+            "msd": msd_aux,
+        }
+    return {"idx": idx, "image_name": image_name, "skipped": False, "out_row": out_row, "result": result if validation_error is None else None}
 
 
 def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
@@ -234,6 +334,7 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
 
     out_split_dir = ensure_dir(args.out_dir / split)
     output_rows: list[dict[str, Any]] = []
+    skipped_rows: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     fallback_count = 0
     skipped_count = 0
@@ -249,141 +350,67 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
     graph_label_count = 0
     source_keys = candidate_source_keys(args.source_key, args.fallback_source_keys)
 
-    for idx, row in enumerate(tqdm(rows, desc=f"RFL {split}")):
-        image_name = row.get("image_name") or Path(str(row.get("file_name", f"{idx:06d}"))).name
-        source = ""
-        selected_source_key = args.source_key
-        result = None
-        validation_error = None
-        source_errors: list[dict[str, str]] = []
-        for source_key in source_keys:
-            try:
-                candidate_source = lookup_value(row, source_key)
-            except KeyError:
-                source_errors.append(
-                    {
-                        "source_key": source_key,
-                        "error": f"missing source key: {source_key}",
-                    }
-                )
-                continue
-            candidate_result = convert_ssml_to_rfl(
-                candidate_source,
-                args.rfl_tool_dir,
-                need_ring_num=args.need_ring_count,
-            )
-            candidate_error = validate_rfl_result(candidate_result)
-            if candidate_error is None:
-                source = candidate_source
-                selected_source_key = source_key
-                result = candidate_result
-                validation_error = None
-                break
-            if validation_error is None:
-                validation_error = candidate_error
-            source_errors.append(
-                {
-                    "source_key": source_key,
-                    "error": candidate_error,
-                }
-            )
-        if validation_error is None and result is None:
-            validation_error = "No source keys could be converted"
+    num_workers = getattr(args, "num_workers", None) or max(1, cpu_count() - 1)
 
-        if validation_error is None:
-            target = result.target
-            status = "converted"
+    if num_workers > 1:
+        params = [
+            (idx, row, source_keys, args.rfl_tool_dir, args.target_field,
+             args.graph_label_field, args.need_ring_count, args.on_error)
+            for idx, row in enumerate(rows)
+        ]
+        futures = {}
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            for p in params:
+                futures[executor.submit(convert_row, *p)] = p[0]
+            results = []
+            for future in as_completed(futures):
+                results.append(future.result())
+        results.sort(key=lambda x: x["idx"])
+        results_list = results
+    else:
+        results_list = [convert_row(idx, row, source_keys, args.rfl_tool_dir, args.target_field,
+                                   args.graph_label_field, args.need_ring_count, args.on_error)
+                       for idx, row in enumerate(tqdm(rows, desc=f"RFL {split}"))]
+
+    for item in results_list:
+        if item["skipped"]:
+            skipped_count += 1
+            skipped_rows.append({
+                "split": split,
+                "row": item["idx"],
+                "image_name": item["image_name"],
+                "source_key": args.source_key,
+                "tried_source_keys": source_keys,
+                "error": item["error"],
+                "source_errors": item["source_errors"],
+            })
+            continue
+        out_row = item["out_row"]
+        result = item["result"]
+        if result is not None:
             converted_count += 1
+            selected_source_key = out_row.get("target_source_key", args.source_key)
             if selected_source_key == args.source_key:
                 converted_primary_count += 1
-            converted_source_counts[selected_source_key] = (
-                converted_source_counts.get(selected_source_key, 0) + 1
-            )
+            converted_source_counts[selected_source_key] = converted_source_counts.get(selected_source_key, 0) + 1
             token_lengths.append(len(result.tokens))
             if result.ring_count is not None:
                 ring_counts.append(result.ring_count)
             if "<ea>" not in result.tokens:
                 missing_ea_count += 1
-            msd_aux = build_msd_auxiliary(result)
-            branch_connection_counts.append(len(msd_aux["branch_connection_pairs"]))
-            branch_candidate_counts.append(len(msd_aux["branch_token_indices"]))
-            bond_candidate_counts.append(len(msd_aux["bond_token_indices"]))
-            graph_label = None
-            if args.graph_label_field:
-                restore = restore_rfl_text_to_chemfig(
-                    target,
-                    args.rfl_tool_dir,
-                    branch_pairs=msd_connection_token_pairs(msd_aux),
-                    cond_data=result.cond_data,
-                )
-                if not restore.success:
-                    raise RuntimeError(
-                        f"RFL graph-label restore failed for {split} row {idx} "
-                        f"({image_name}): {restore.error}"
-                    )
-                graph_label = restore.chemfig
+            msd_aux = out_row.get("rfl", {}).get("msd", {})
+            branch_connection_counts.append(len(msd_aux.get("branch_connection_pairs", [])))
+            branch_candidate_counts.append(len(msd_aux.get("branch_token_indices", [])))
+            bond_candidate_counts.append(len(msd_aux.get("bond_token_indices", [])))
+            if out_row["targets"].get(args.graph_label_field):
                 graph_label_count += 1
         else:
-            failures.append(
-                {
-                    "split": split,
-                    "row": idx,
-                    "image_name": image_name,
-                    "source_key": args.source_key,
-                    "tried_source_keys": source_keys,
-                    "error": validation_error,
-                    "source_errors": source_errors,
-                }
-            )
-            if args.on_error == "raise":
-                tried = "; ".join(
-                    f"{item['source_key']}: {item['error']}" for item in source_errors
-                )
-                raise RuntimeError(
-                    f"RFL conversion failed for {split} row {idx} "
-                    f"({image_name}): {validation_error}. Tried: {tried}"
-                )
-            if args.on_error == "skip":
-                skipped_count += 1
-                continue
-            selected_source_key = args.source_key
-            try:
-                source = lookup_value(row, args.source_key)
-            except KeyError:
-                source = ""
-            target = source
-            status = "fallback"
             fallback_count += 1
-            msd_aux = {}
-            graph_label = None
-
-        targets = dict(row.get("targets") or {})
-        targets[target_name(selected_source_key)] = source
-        targets[args.target_field] = target
-        if graph_label is not None:
-            targets[args.graph_label_field] = graph_label
-        out_row = dict(row)
-        out_row["file_name"] = resolve_image_path(in_split_dir, row)
-        out_row["image_name"] = image_name
-        out_row["target"] = target
-        out_row["target_field"] = args.target_field
-        out_row["target_source_key"] = selected_source_key
-        out_row["targets"] = targets
-        out_row["target_status"] = status
-        if not args.no_auxiliary and status == "converted":
-            out_row[args.aux_field] = build_auxiliary_metadata(
-                args,
-                selected_source_key,
-                result,
-            )
-        elif status == "fallback":
-            out_row["conversion_error"] = failures[-1]["error"] if failures else None
-            out_row["conversion_source_errors"] = (
-                failures[-1].get("source_errors") if failures else None
-            )
+            out_row["conversion_error"] = None
         output_rows.append(out_row)
 
     write_jsonl(output_rows, out_split_dir / "metadata.jsonl")
+    all_failures = skipped_rows + failures
     return {
         "split": split,
         "input_rows": len(rows),
@@ -393,8 +420,8 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
         "converted_by_source_key": converted_source_counts,
         "fallback": fallback_count,
         "skipped": skipped_count,
-        "failures_preview": failures[:50],
-        "failure_count": len(failures),
+        "failures_preview": all_failures[:50],
+        "failure_count": len(all_failures),
         "target_len_min": min(token_lengths) if token_lengths else 0,
         "target_len_p50": percentile(token_lengths, 0.50),
         "target_len_p95": percentile(token_lengths, 0.95),
@@ -409,7 +436,7 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
         "bond_candidate_max": max(bond_candidate_counts) if bond_candidate_counts else 0,
         "graph_label_field": args.graph_label_field,
         "graph_label_count": graph_label_count,
-        "failures": failures,
+        "failures": all_failures,
     }
 
 
