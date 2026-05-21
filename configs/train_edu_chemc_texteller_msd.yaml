@@ -41,7 +41,7 @@ augmentation:
 
 vocab:
   file: external/RFL-MSD/dict/vocab.txt
-  extend_from_dataset: true
+  extend_from_dataset: false
   extend_splits:
     - train
   min_frequency: 1
