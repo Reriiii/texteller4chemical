@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import random
 import shutil
 import sys
 import time
@@ -13,7 +14,7 @@ from typing import Any
 
 import torch
 from accelerate import Accelerator
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, AutoProcessor, get_scheduler
 
@@ -37,6 +38,54 @@ from chemtexteller.utils import ensure_dir, load_yaml, save_json, save_yaml, set
 
 
 logger = setup_logging()
+
+
+class LengthBucketBatchSampler(Sampler[list[int]]):
+    """Shuffle by buckets, then batch samples with similar target lengths."""
+
+    def __init__(
+        self,
+        lengths: list[int],
+        *,
+        batch_size: int,
+        bucket_size: int,
+        shuffle: bool = True,
+        seed: int = 42,
+        drop_last: bool = False,
+    ) -> None:
+        self.lengths = [int(item) for item in lengths]
+        self.batch_size = max(1, int(batch_size))
+        self.bucket_size = max(self.batch_size, int(bucket_size))
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return math.ceil(len(self.lengths) / self.batch_size)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.lengths)))
+        if self.shuffle:
+            rng.shuffle(indices)
+        batches: list[list[int]] = []
+        for start in range(0, len(indices), self.bucket_size):
+            bucket = indices[start : start + self.bucket_size]
+            bucket.sort(key=lambda idx: self.lengths[idx])
+            for batch_start in range(0, len(bucket), self.batch_size):
+                batch = bucket[batch_start : batch_start + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch)
+        if self.shuffle:
+            rng.shuffle(batches)
+        yield from batches
 
 
 def parse_args() -> argparse.Namespace:
@@ -220,6 +269,27 @@ def dataloader_kwargs(config: dict[str, Any], *, train: bool) -> dict[str, Any]:
     if train:
         kwargs["shuffle"] = True
     return kwargs
+
+
+def build_train_batch_sampler(
+    config: dict[str, Any],
+    dataset: TextellerMsdDataset,
+) -> LengthBucketBatchSampler | None:
+    sampling = dict(config.get("sampling") or {})
+    bucket_cfg = dict(sampling.get("length_bucketed") or {})
+    if not bool(bucket_cfg.get("enabled", False)):
+        return None
+    training = dict(config.get("training") or {})
+    batch_size = int(training.get("per_device_train_batch_size", 4))
+    bucket_size = int(bucket_cfg.get("bucket_size", max(batch_size * 128, 512)))
+    return LengthBucketBatchSampler(
+        list(getattr(dataset, "target_lengths", [])),
+        batch_size=batch_size,
+        bucket_size=bucket_size,
+        shuffle=bool(bucket_cfg.get("shuffle", True)),
+        seed=int(config.get("seed", 42)),
+        drop_last=bool(bucket_cfg.get("drop_last", False)),
+    )
 
 
 def build_datasets(
@@ -454,12 +524,27 @@ def main() -> None:
     processor = load_processor(args.pretrained_model_name_or_path, args.trust_remote_code)
     train_dataset, eval_dataset = build_datasets(args, config, vocab, processor)
     collator = TextellerMsdCollator(vocab, include_metadata=True)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(training.get("per_device_train_batch_size", 4)),
-        collate_fn=collator,
-        **dataloader_kwargs(config, train=True),
-    )
+    train_batch_sampler = build_train_batch_sampler(config, train_dataset)
+    if train_batch_sampler is not None:
+        logger.info(
+            "Length-bucketed batching enabled | batch_size=%s bucket_size=%s batches=%s",
+            train_batch_sampler.batch_size,
+            train_batch_sampler.bucket_size,
+            len(train_batch_sampler),
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            collate_fn=collator,
+            **dataloader_kwargs(config, train=False),
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(training.get("per_device_train_batch_size", 4)),
+            collate_fn=collator,
+            **dataloader_kwargs(config, train=True),
+        )
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=int(training.get("per_device_eval_batch_size", 4)),
@@ -512,15 +597,18 @@ def main() -> None:
     global_step = 0
 
     for epoch in range(1, num_epochs + 1):
+        if train_batch_sampler is not None:
+            train_batch_sampler.set_epoch(epoch)
         if epoch == freeze_encoder_epochs + 1 and freeze_encoder_epochs > 0:
             accelerator.unwrap_model(model).freeze_encoder(False)
             logger.info("Unfroze TexTeller encoder at epoch %s.", epoch)
         start_time = time.time()
         model.train()
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}", disable=not accelerator.is_local_main_process)
-        running_loss = 0.0
-        running_seq = 0.0
-        running_mem = 0.0
+        running_loss = torch.zeros((), device=accelerator.device)
+        running_seq = torch.zeros((), device=accelerator.device)
+        running_mem = torch.zeros((), device=accelerator.device)
+        progress_update_steps = max(1, int(training.get("progress_update_steps", 50)))
         for step, batch in enumerate(progress, start=1):
             with accelerator.accumulate(model):
                 outputs = model(**model_inputs(batch))
@@ -532,18 +620,22 @@ def main() -> None:
                 scheduler.step()
                 optimizer.zero_grad()
             global_step += 1
-            running_loss += float(outputs["loss"].detach().cpu())
-            running_seq += float(outputs["sequence_loss"].detach().cpu())
-            running_mem += float(outputs["memory_loss"].detach().cpu())
-            if accelerator.is_local_main_process:
-                progress.set_postfix(loss=running_loss / step, seq=running_seq / step, mem=running_mem / step)
+            running_loss += outputs["loss"].detach()
+            running_seq += outputs["sequence_loss"].detach()
+            running_mem += outputs["memory_loss"].detach()
+            if accelerator.is_local_main_process and (step == 1 or step % progress_update_steps == 0):
+                progress.set_postfix(
+                    loss=f"{float((running_loss / step).detach().cpu()):.3g}",
+                    seq=f"{float((running_seq / step).detach().cpu()):.3g}",
+                    mem=f"{float((running_mem / step).detach().cpu()):.3g}",
+                )
 
         train_metrics = {
             "epoch": epoch,
             "step": global_step,
-            "train_loss": running_loss / max(1, len(train_loader)),
-            "train_sequence_loss": running_seq / max(1, len(train_loader)),
-            "train_memory_loss": running_mem / max(1, len(train_loader)),
+            "train_loss": float((running_loss / max(1, len(train_loader))).detach().cpu()),
+            "train_sequence_loss": float((running_seq / max(1, len(train_loader))).detach().cpu()),
+            "train_memory_loss": float((running_mem / max(1, len(train_loader))).detach().cpu()),
             "train_epoch_runtime": time.time() - start_time,
         }
         eval_metrics = evaluate_loss(model, eval_loader, accelerator)

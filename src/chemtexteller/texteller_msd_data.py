@@ -132,6 +132,7 @@ class TextellerMsdDataset(Dataset[dict[str, Any]]):
         self.max_target_length = int(max_target_length)
         self.target_length_policy = target_length_policy.lower()
         self._filter_by_target_length()
+        self.target_lengths = self._target_lengths()
 
     def __len__(self) -> int:
         return len(self.samples)
