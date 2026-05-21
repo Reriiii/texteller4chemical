@@ -221,6 +221,7 @@ def msd_connection_token_pairs(msd_aux: dict[str, Any]) -> list[tuple[int, int]]
 def convert_row(
     idx: int,
     row: dict[str, Any],
+    source_split_dir: Path,
     source_keys: list[str],
     rfl_tool_dir: Path,
     target_field: str,
@@ -304,6 +305,7 @@ def convert_row(
         targets[graph_label_field] = graph_label
 
     out_row = dict(row)
+    out_row["file_name"] = resolve_image_path(source_split_dir, row)
     out_row["image_name"] = image_name
     out_row["target"] = target
     out_row["target_field"] = target_field
@@ -363,7 +365,7 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
                 while batch_start < total or pending:
                     while batch_start < total and len(pending) < batch_size:
                         p = (
-                            batch_start, rows[batch_start], source_keys, args.rfl_tool_dir,
+                            batch_start, rows[batch_start], in_split_dir, source_keys, args.rfl_tool_dir,
                             args.target_field, args.graph_label_field, args.need_ring_count,
                             args.on_error,
                         )
@@ -377,7 +379,7 @@ def convert_split(args: argparse.Namespace, split: str) -> dict[str, Any]:
                         pbar.update(1)
         results_list.sort(key=lambda x: x["idx"])
     else:
-        results_list = [convert_row(idx, row, source_keys, args.rfl_tool_dir, args.target_field,
+        results_list = [convert_row(idx, row, in_split_dir, source_keys, args.rfl_tool_dir, args.target_field,
                                    args.graph_label_field, args.need_ring_count, args.on_error)
                        for idx, row in enumerate(tqdm(rows, desc=f"RFL {split}"))]
 
