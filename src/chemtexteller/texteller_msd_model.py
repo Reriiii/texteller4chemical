@@ -320,8 +320,10 @@ class SequenceGenerator(nn.Module):
         _, _, _, height, width = cur_memory_weight.shape
         new_feature = torch.cat([cur_output, cur_state, cur_ctx], dim=1).unsqueeze(1)
         new_feature = new_feature * update_mask.view(batch_size, 1, 1)
+        new_feature = new_feature.to(cur_memory.dtype)
         new_weight = torch.cat([cur_weight, cur_cum_weight], dim=1).unsqueeze(1)
         new_weight = new_weight * update_mask.view(batch_size, 1, 1, 1, 1)
+        new_weight = new_weight.to(cur_memory_weight.dtype)
         index = (cur_mem_update_info * update_mask).long().detach()
         memory = torch.scatter_add(
             cur_memory,
@@ -437,6 +439,7 @@ class SequenceGenerator(nn.Module):
             if bond_mask.sum() > 0:
                 new_feature = torch.cat([states[2], old_state, states[7]], dim=1)
                 new_feature = (new_feature * bond_mask.unsqueeze(1)).unsqueeze(1)
+                new_feature = new_feature.to(selected_bonds.dtype)
                 index = (bond_update * bond_mask).long().detach()
                 selected_bonds.scatter_add_(
                     1,
@@ -453,6 +456,7 @@ class SequenceGenerator(nn.Module):
             if branch_mask.sum() > 0:
                 new_feature = torch.cat([states[2], old_state, states[7]], dim=1)
                 new_feature = (new_feature * branch_mask.unsqueeze(1)).unsqueeze(1)
+                new_feature = new_feature.to(selected_branchs.dtype)
                 index = (branch_update * branch_mask).long().detach()
                 selected_branchs.scatter_add_(
                     1,
